@@ -24,8 +24,8 @@ from pathlib import Path
 
 # project generation configurations
 configurations = [
-    {"name": "Visual Studio 2026 - Vulkan",  "args": ["vs2026", "vulkan"]},
-    {"name": "Visual Studio 2026 - D3D12 (WIP)",   "args": ["vs2026", "d3d12"]},
+    {"name": "Visual Studio 2022 - Vulkan",  "args": ["vs2022", "vulkan"]},
+    {"name": "Visual Studio 2022 - D3D12 (WIP)",   "args": ["vs2022", "d3d12"]},
     {"name": "GMake2 - Vulkan (Linux)",      "args": ["gmake2", "vulkan_linux"]},
 ]
 

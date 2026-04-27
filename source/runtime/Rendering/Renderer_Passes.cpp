@@ -2297,6 +2297,7 @@ namespace spartan
         cmd_list->EndTimeblock();
     }
 
+    // 基于深度图的自动对焦景深后处理 shader，用 compute shader 实现电影感背景/前景虚化。
     void Renderer::Pass_DepthOfField(RHI_CommandList* cmd_list, RHI_Texture* tex_in, RHI_Texture* tex_out)
     {
         // acquire shader
