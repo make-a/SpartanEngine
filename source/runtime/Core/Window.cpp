@@ -48,7 +48,8 @@ namespace spartan
         uint32_t height          = 720;
         float dpi_scale          = 1.0f;
         bool wants_to_close      = false;
-        SDL_Window* window       = nullptr;
+        bool fullscreen_toggle_pending = false;
+        SDL_Window* window             = nullptr;
 
         // splash-screen
         bool m_show_splash_screen              = true;
@@ -70,38 +71,37 @@ namespace spartan
             const int x = area->x;
             const int y = area->y;
             const int resize_margin = static_cast<int>(resize_border * dpi_scale);
+            const bool is_maximized = (SDL_GetWindowFlags(win) & SDL_WINDOW_MAXIMIZED) != 0;
 
-            // check corners first (for diagonal resize)
-            bool top    = y < resize_margin;
-            bool bottom = y >= h - resize_margin;
-            bool left   = x < resize_margin;
-            bool right  = x >= w - resize_margin;
-
-            // corner hit tests
-            if (top && left)     return SDL_HITTEST_RESIZE_TOPLEFT;
-            if (top && right)    return SDL_HITTEST_RESIZE_TOPRIGHT;
-            if (bottom && left)  return SDL_HITTEST_RESIZE_BOTTOMLEFT;
-            if (bottom && right) return SDL_HITTEST_RESIZE_BOTTOMRIGHT;
-
-            // edge hit tests
-            if (top)    return SDL_HITTEST_RESIZE_TOP;
-            if (bottom) return SDL_HITTEST_RESIZE_BOTTOM;
-            if (left)   return SDL_HITTEST_RESIZE_LEFT;
-            if (right)  return SDL_HITTEST_RESIZE_RIGHT;
-
-            // title bar area - make draggable only when no imgui items are hovered
-            if (y < static_cast<int>(titlebar_height))
+            // titlebar buttons take priority so the close button stays clickable at the top right corner
+            if (y < static_cast<int>(titlebar_height) && x >= w - static_cast<int>(titlebar_button_width))
             {
-                // exclude window buttons area on the right
-                if (x < w - static_cast<int>(titlebar_button_width))
-                {
-                    // only allow dragging when no imgui items were hovered recently
-                    // use persistence to avoid timing issues between hit test and imgui frame
-                    if (titlebar_hovered_frames == 0)
-                    {
-                        return SDL_HITTEST_DRAGGABLE;
-                    }
-                }
+                return SDL_HITTEST_NORMAL;
+            }
+
+            // resize hit tests, skipped when maximized since resizing is a no op
+            if (!is_maximized)
+            {
+                bool top    = y < resize_margin;
+                bool bottom = y >= h - resize_margin;
+                bool left   = x < resize_margin;
+                bool right  = x >= w - resize_margin;
+
+                if (top && left)     return SDL_HITTEST_RESIZE_TOPLEFT;
+                if (top && right)    return SDL_HITTEST_RESIZE_TOPRIGHT;
+                if (bottom && left)  return SDL_HITTEST_RESIZE_BOTTOMLEFT;
+                if (bottom && right) return SDL_HITTEST_RESIZE_BOTTOMRIGHT;
+
+                if (top)    return SDL_HITTEST_RESIZE_TOP;
+                if (bottom) return SDL_HITTEST_RESIZE_BOTTOM;
+                if (left)   return SDL_HITTEST_RESIZE_LEFT;
+                if (right)  return SDL_HITTEST_RESIZE_RIGHT;
+            }
+
+            // remaining titlebar area is draggable when imgui is not interacting with anything
+            if (y < static_cast<int>(titlebar_height) && titlebar_hovered_frames == 0)
+            {
+                return SDL_HITTEST_DRAGGABLE;
             }
 
             return SDL_HITTEST_NORMAL;
@@ -200,10 +200,6 @@ namespace spartan
         #ifdef _WIN32
         dpi_scale = static_cast<float>(GetDpiForWindow(static_cast<HWND>(GetHandleRaw()))) / 96.0f;
         #endif
-
-        // register library
-        string version = to_string(SDL_MAJOR_VERSION) + "." + to_string(SDL_MINOR_VERSION) + "." + to_string(SDL_MICRO_VERSION);
-        Settings::RegisterThirdPartyLib("SDL", version, "https://www.libsdl.org/");
     }
 
     void Window::Shutdown()
@@ -365,6 +361,21 @@ namespace spartan
 
     void Window::ToggleFullScreen()
 	{
+        fullscreen_toggle_pending = true;
+	}
+
+    bool Window::IsFullScreenTogglePending()
+    {
+        return fullscreen_toggle_pending;
+    }
+
+    void Window::ProcessFullScreenToggle()
+    {
+        if (!fullscreen_toggle_pending)
+            return;
+
+        fullscreen_toggle_pending = false;
+
         if (IsFullScreen())
         {
             Windowed();
@@ -373,7 +384,7 @@ namespace spartan
         {
             FullScreen();
         }
-	}
+    }
 
 	void Window::FullScreenBorderless()
     {
@@ -481,7 +492,7 @@ namespace spartan
     void Window::CreateAndShowSplashScreen()
     {
         // load splash screen image
-        SDL_Surface* image = SDL_LoadBMP("data\\textures\\banner.bmp");
+        SDL_Surface* image = SDL_LoadBMP("data/textures/banner.bmp");
         if (!image)
         {
             SP_LOG_ERROR("Failed to load splash screen image: %s", SDL_GetError());
@@ -542,6 +553,26 @@ namespace spartan
         SDL_DestroyTexture(m_splash_screen_texture);
         SDL_DestroyRenderer(m_splash_screen_renderer);
         SDL_DestroyWindow(m_splash_screen_window);
+    }
+
+    void Window::SetSplashScreenVisible(bool visible)
+    {
+        if (!m_splash_screen_window)
+            return;
+
+        if (visible)
+        {
+            SDL_ShowWindow(m_splash_screen_window);
+        }
+        else
+        {
+            SDL_HideWindow(m_splash_screen_window);
+        }
+    }
+
+    void Window::PumpEvents()
+    {
+        SDL_PumpEvents();
     }
 
     void Window::SetTitleBarHeight(float height)

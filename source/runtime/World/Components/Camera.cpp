@@ -22,7 +22,8 @@ CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 //= INCLUDES ========================
 #include "pch.h"
 #include "Camera.h"
-#include "Renderable.h"
+#include "Render.h"
+#include "Spline.h"
 #include "Window.h"
 #include "Physics.h"
 #include "Light.h"
@@ -30,6 +31,7 @@ CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 #include "../../Input/Input.h"
 #include "../../Rendering/Renderer.h"
 #include "../../Display/Display.h"
+#include "../../XR/Xr.h"
 SP_WARNINGS_OFF
 #include "../IO/pugixml.hpp"
 SP_WARNINGS_ON
@@ -75,7 +77,16 @@ namespace spartan
             SetFlag(CameraFlags::IsDirty, true);
         }
 
+        // always process input for movement (gamepad, keyboard, physics body control)
         ProcessInput();
+
+        // note: when an xr session is running, we intentionally do NOT overwrite the
+        // camera entity's local transform with the hmd pose.  the entity stays where
+        // gameplay placed it (e.g. on the player capsule at head height) and acts as
+        // the "rig root" in world space.  the hmd eye poses are then composed on top
+        // of the camera's world transform inside Xr::UpdateViews, which is what turns
+        // head motion into per-eye world-space translations/rotations for rendering.
+
         ComputeMatrices();
     }
 
@@ -140,7 +151,7 @@ namespace spartan
         return m_frustum.IsVisible(center, extents);
     }
 
-    bool Camera::IsInViewFrustum(shared_ptr<Renderable> renderable) const
+    bool Camera::IsInViewFrustum(shared_ptr<Render> renderable) const
     {
         const BoundingBox& box = renderable->GetBoundingBox();
         return IsInViewFrustum(box);
@@ -170,10 +181,10 @@ namespace spartan
         const vector<Entity*>& entities = World::GetEntities();
         for (Entity* entity : entities)
         {
-            if (!entity->GetComponent<Renderable>())
+            if (!entity->GetComponent<Render>())
                 continue;
 
-            const BoundingBox& aabb = entity->GetComponent<Renderable>()->GetBoundingBox();
+            const BoundingBox& aabb = entity->GetComponent<Render>()->GetBoundingBox();
             float distance          = ray.HitDistance(aabb);
             if (distance == numeric_limits<float>::infinity())
                 continue;
@@ -181,81 +192,136 @@ namespace spartan
             m_pick_hits.emplace_back(entity, Vector3::Zero, distance, distance == 0.0f);
         }
 
-        if (m_pick_hits.empty())
-        {
-            ClearSelection();
-            return;
-        }
-
         Vector2 cursor         = Input::GetMousePosition();
         float best_screen_dist = numeric_limits<float>::max();
         float best_depth       = numeric_limits<float>::max();
         Entity* best_entity    = nullptr;
-        for (RayHitResult& broad_hit : m_pick_hits)
+
+        // mesh-based triangle picking
+        if (!m_pick_hits.empty())
         {
-            Renderable* renderable = broad_hit.m_entity->GetComponent<Renderable>();
-
-            // query mesh size first to reserve exact capacity and avoid allocations
-            uint32_t index_count  = renderable->GetIndexCount();
-            uint32_t vertex_count = renderable->GetVertexCount();
-            
-            // reserve exact capacity needed to avoid heap allocations in GetGeometry::resize()
-            // only reserve if current capacity is insufficient
-            if (m_pick_indices.capacity() < index_count)
+            for (RayHitResult& broad_hit : m_pick_hits)
             {
-                m_pick_indices.reserve(index_count);
-            }
-            if (m_pick_vertices.capacity() < vertex_count)
-            {
-                m_pick_vertices.reserve(vertex_count);
-            }
-            
-            // clear and reuse pre-allocated buffers 
-            m_pick_indices.clear();
-            m_pick_vertices.clear();
+                Render* renderable = broad_hit.m_entity->GetComponent<Render>();
 
-            renderable->GetGeometry(&m_pick_indices, &m_pick_vertices);
-            if (m_pick_indices.empty() || m_pick_vertices.empty())
-                continue;
-
-            const Matrix& transform = broad_hit.m_entity->GetMatrix();
-
-            for (uint32_t i = 0; i < m_pick_indices.size(); i += 3)
-            {
-                Vector3 p1(m_pick_vertices[m_pick_indices[i]].pos);
-                Vector3 p2(m_pick_vertices[m_pick_indices[i + 1]].pos);
-                Vector3 p3(m_pick_vertices[m_pick_indices[i + 2]].pos);
-
-                p1 = p1 * transform;
-                p2 = p2 * transform;
-                p3 = p3 * transform;
-
-                float distance = ray.HitDistance(p1, p2, p3);
-                if (distance == numeric_limits<float>::infinity())
-                    continue;
-
-                Vector3 world_hit = ray.GetStart() + ray.GetDirection() * distance;
-
-                // project to clip space
-                Vector4 clip = Vector4(world_hit, 1.0f) * GetViewProjectionMatrix();
-                if (clip.w == 0.0f)
-                    continue;
-
-                // ndc → screen
-                Vector2 screen_pos(
-                    (clip.x / clip.w * 0.5f + 0.5f) * Renderer::GetViewport().width,
-                    (clip.y / clip.w * 0.5f + 0.5f) * Renderer::GetViewport().height
-                );
-
-                float screen_dist = (screen_pos - cursor).Length();
-
-                // prefer smallest screen distance, then depth
-                if (screen_dist < best_screen_dist || (screen_dist == best_screen_dist && distance < best_depth))
+                // query mesh size first to reserve exact capacity and avoid allocations
+                uint32_t index_count  = renderable->GetIndexCount();
+                uint32_t vertex_count = renderable->GetVertexCount();
+                
+                // reserve exact capacity needed to avoid heap allocations in GetGeometry::resize()
+                // only reserve if current capacity is insufficient
+                if (m_pick_indices.capacity() < index_count)
                 {
-                    best_screen_dist = screen_dist;
-                    best_depth       = distance;
-                    best_entity      = broad_hit.m_entity;
+                    m_pick_indices.reserve(index_count);
                 }
+                if (m_pick_vertices.capacity() < vertex_count)
+                {
+                    m_pick_vertices.reserve(vertex_count);
+                }
+                
+                // clear and reuse pre-allocated buffers 
+                m_pick_indices.clear();
+                m_pick_vertices.clear();
+
+                renderable->GetGeometry(&m_pick_indices, &m_pick_vertices);
+                if (m_pick_indices.empty() || m_pick_vertices.empty())
+                    continue;
+
+                const Matrix& transform = broad_hit.m_entity->GetMatrix();
+
+                for (uint32_t i = 0; i < m_pick_indices.size(); i += 3)
+                {
+                    Vector3 p1(m_pick_vertices[m_pick_indices[i]].pos);
+                    Vector3 p2(m_pick_vertices[m_pick_indices[i + 1]].pos);
+                    Vector3 p3(m_pick_vertices[m_pick_indices[i + 2]].pos);
+
+                    p1 = p1 * transform;
+                    p2 = p2 * transform;
+                    p3 = p3 * transform;
+
+                    float distance = ray.HitDistance(p1, p2, p3);
+                    if (distance == numeric_limits<float>::infinity())
+                        continue;
+
+                    Vector3 world_hit = ray.GetStart() + ray.GetDirection() * distance;
+
+                    // project to clip space
+                    Vector4 clip = Vector4(world_hit, 1.0f) * GetViewProjectionMatrix();
+                    if (clip.w == 0.0f)
+                        continue;
+
+                    // ndc → screen
+                    Vector2 screen_pos(
+                        (clip.x / clip.w * 0.5f + 0.5f) * Renderer::GetViewport().width,
+                        (clip.y / clip.w * 0.5f + 0.5f) * Renderer::GetViewport().height
+                    );
+
+                    float screen_dist = (screen_pos - cursor).Length();
+
+                    // prefer smallest screen distance, then depth
+                    if (screen_dist < best_screen_dist || (screen_dist == best_screen_dist && distance < best_depth))
+                    {
+                        best_screen_dist = screen_dist;
+                        best_depth       = distance;
+                        best_entity      = broad_hit.m_entity;
+                    }
+                }
+            }
+        }
+
+        // spline control point picking
+        {
+            const float pick_radius_px = 20.0f;
+            float best_spline_dist     = numeric_limits<float>::max();
+            Entity* best_spline_entity = nullptr;
+
+            // ray.m_direction is set to a world-space position (from ScreenToWorldCoordinates),
+            // not a normalized direction, so compute the actual direction ourselves
+            Vector3 ray_origin = ray.GetStart();
+            Vector3 ray_dir    = ray.GetDirection() - ray_origin;
+            ray_dir.Normalize();
+
+            for (Entity* entity : entities)
+            {
+                Spline* spline = entity->GetComponent<Spline>();
+                if (!spline)
+                    continue;
+
+                for (uint32_t i = 0; i < entity->GetChildrenCount(); i++)
+                {
+                    Entity* point_entity = entity->GetChildByIndex(i);
+                    if (!point_entity)
+                        continue;
+
+                    Vector3 world_pos = point_entity->GetPosition();
+
+                    // depth along the ray direction
+                    float depth = (world_pos - ray_origin).Dot(ray_dir);
+                    if (depth <= 0.0f)
+                        continue;
+
+                    // perpendicular distance from the ray to this point: ||(P - O) x D||
+                    Vector3 to_point        = world_pos - ray_origin;
+                    float distance_from_ray = to_point.Cross(ray_dir).Length();
+
+                    // convert pick radius from screen pixels to world-space at this depth
+                    float viewport_width  = Renderer::GetViewport().width;
+                    float meters_per_pixel = (2.0f * depth * tanf(GetFovHorizontalRad() * 0.5f)) / viewport_width;
+                    float pick_threshold   = pick_radius_px * meters_per_pixel;
+
+                    if (distance_from_ray > pick_threshold)
+                        continue;
+                    if (distance_from_ray < best_spline_dist)
+                    {
+                        best_spline_dist   = distance_from_ray;
+                        best_spline_entity = point_entity;
+                    }
+                }
+            }
+
+            if (best_spline_entity)
+            {
+                best_entity = best_spline_entity;
             }
         }
 
@@ -458,8 +524,9 @@ namespace spartan
         bool mouse_click_right_down = Input::GetKeyDown(KeyCode::Click_Right);
         bool mouse_click_right      = Input::GetKey(KeyCode::Click_Right);
         bool mouse_click_left_down  = Input::GetKeyDown(KeyCode::Click_Left);
+        bool is_playing            = Engine::IsFlagSet(EngineMode::Playing);
 
-        // if the camera is paranted to an entity with a physics body, we will control that instead
+        // if the camera is parented to an entity with a physics body, we will control that instead
         Physics* physics_body = nullptr;
         if (Entity* parent = GetEntity()->GetParent())
         {
@@ -469,17 +536,88 @@ namespace spartan
             }
         }
 
+        auto update_flashlight = [&]()
+        {
+            if (!m_flashlight && !is_playing && !GetFlag(CameraFlags::Flashlight) && !button_flashlight)
+                return;
+
+            // create flashlight entity once
+            if (!m_flashlight)
+            {
+                // entity
+                m_flashlight = World::CreateEntity();
+                m_flashlight->SetObjectName("flashlight");
+                m_flashlight->SetTransient(true); // don't serialize - dynamically created
+                m_flashlight->SetParent(GetEntity());
+                m_flashlight->SetRotationLocal(Quaternion::Identity);
+
+                // component
+                Light* light = m_flashlight->AddComponent<Light>();
+                light->SetLightType(LightType::Spot);
+                light->SetColor(Color(1.0f, 1.0f, 1.0f, 1.0f));
+                light->SetRange(100.0f);
+                light->SetIntensity(2000.0f);
+                light->SetAngle(30.0f * math::deg_to_rad);
+                light->SetFlag(LightFlags::Volumetric, false);
+                light->SetFlag(LightFlags::ShadowsScreenSpace, false);
+                light->SetFlag(LightFlags::Shadows, true);
+            }
+
+            // toggle
+            if (button_flashlight && is_playing)
+            {
+                SetFlag(CameraFlags::Flashlight, !GetFlag(CameraFlags::Flashlight));
+            }
+
+            // ensure flashlight follows camera and respects active state
+            if (m_flashlight)
+            {
+                // ensure parent is set (in case camera entity was recreated)
+                if (m_flashlight->GetParent() != GetEntity())
+                {
+                    m_flashlight->SetParent(GetEntity());
+                    m_flashlight->SetRotationLocal(Quaternion::Identity);
+                }
+
+                // keep the entity active so the world keeps tracking the light,
+                // then use intensity to control whether it contributes
+                bool flashlight_enabled = GetFlag(CameraFlags::Flashlight);
+                m_flashlight->SetActive(true);
+                
+                if (Light* light = m_flashlight->GetComponent<Light>())
+                {
+                    // set intensity to 0 when off, restore to 2000 when on
+                    light->SetIntensity(flashlight_enabled ? 2000.0f : 0.0f);
+                }
+            }
+        };
+
+        // skip fps control if the physics body is disabled (e.g. when in a vehicle)
+        if (physics_body && !physics_body->IsEnabled())
+        {
+            // keep non-movement camera features working while the controller is disabled
+            update_flashlight();
+            return;
+        }
+
         // deduce all states into booleans (some states exists as part of the class, so no need to deduce here)
         bool mouse_in_viewport    = Input::GetMouseIsInViewport();
         bool is_controlled        = GetFlag(CameraFlags::IsControlled);
         bool wants_cursor_hidden  = GetFlag(CameraFlags::WantsCursorHidden);
         bool is_gamepad_connected = Input::IsGamepadConnected();
-        bool is_playing           = Engine::IsFlagSet(EngineMode::Playing);
         bool has_physics_body     = physics_body != nullptr;
         bool is_grounded          = has_physics_body ? physics_body->IsGrounded() : false;
         bool is_crouching         = button_crouch && is_grounded;
         m_is_walking              = (button_move_forward || button_move_backward || button_move_left || button_move_right) && is_grounded;
-        
+
+        // when transitioning from editor to play mode, snap the camera back to the
+        // controller's eye height so any free-fly offset accumulated in editor is reset
+        if (is_playing && !m_was_playing && has_physics_body && physics_body->GetBodyType() == BodyType::Controller)
+        {
+            GetEntity()->SetPositionLocal(physics_body->GetControllerTopLocal());
+        }
+        m_was_playing = is_playing;
+
         // behavior: control activation and cursor handling
         {
             bool control_initiated  = mouse_click_right_down && mouse_in_viewport;
@@ -509,10 +647,11 @@ namespace spartan
     
         // behavior: mouse look and movement direction calculation
         Vector3 movement_direction = Vector3::Zero;
+        bool is_xr_active = Xr::IsSessionRunning();
         if (is_controlled || is_gamepad_connected)
         {
-            // cursor edge wrapping
-            if (is_controlled)
+            // cursor edge wrapping (skip in xr mode - head tracking handles rotation)
+            if (is_controlled && !is_xr_active)
             {
                 Vector2 mouse_pos = Input::GetMousePosition();
                 uint32_t edge = 5;
@@ -526,30 +665,33 @@ namespace spartan
                 }
             }
     
-        // mouse and gamepad look - use local rotation to avoid unstable matrix decomposition
-        Quaternion current_rotation = GetEntity()->GetRotationLocal();
-        Vector2 input_delta = Vector2::Zero;
-        if (is_controlled)
-        {
-            input_delta = Input::GetMouseDelta() * m_mouse_sensitivity;
-        }
-        else if (is_gamepad_connected)
-        {
-            // gamepad stick is a rate (rotation speed), not accumulated movement like mouse
-            // scale by delta_time and a base rotation speed for framerate-independent behavior
-            const float gamepad_rotation_speed = 120.0f; // degrees per second at full stick deflection
-            input_delta = Input::GetGamepadThumbStickRight() * gamepad_rotation_speed * delta_time;
-        }
-            Quaternion yaw_increment   = Quaternion::FromAxisAngle(Vector3::Up, input_delta.x * deg_to_rad);
-            Quaternion pitch_increment = Quaternion::FromAxisAngle(Vector3::Right, input_delta.y * deg_to_rad);
-            Quaternion new_rotation    = yaw_increment * current_rotation * pitch_increment;
-            Vector3 forward            = new_rotation * Vector3::Forward;
-            float pitch_angle          = asin(-forward.y) * rad_to_deg;
-            if (pitch_angle > 80.0f || pitch_angle < -80.0f)
+            // mouse and gamepad look - skip in xr mode since head tracking handles rotation
+            if (!is_xr_active)
             {
-                new_rotation = yaw_increment * current_rotation;
+                Quaternion current_rotation = GetEntity()->GetRotationLocal();
+                Vector2 input_delta = Vector2::Zero;
+                if (is_controlled)
+                {
+                    input_delta = Input::GetMouseDelta() * m_mouse_sensitivity;
+                }
+                else if (is_gamepad_connected)
+                {
+                    // gamepad stick is a rate (rotation speed), not accumulated movement like mouse
+                    // scale by delta_time and a base rotation speed for framerate-independent behavior
+                    const float gamepad_rotation_speed = 120.0f; // degrees per second at full stick deflection
+                    input_delta = Input::GetGamepadThumbStickRight() * gamepad_rotation_speed * delta_time;
+                }
+                Quaternion yaw_increment   = Quaternion::FromAxisAngle(Vector3::Up, input_delta.x * deg_to_rad);
+                Quaternion pitch_increment = Quaternion::FromAxisAngle(Vector3::Right, input_delta.y * deg_to_rad);
+                Quaternion new_rotation    = yaw_increment * current_rotation * pitch_increment;
+                Vector3 forward            = new_rotation * Vector3::Forward;
+                float pitch_angle          = asin(-forward.y) * rad_to_deg;
+                if (pitch_angle > 80.0f || pitch_angle < -80.0f)
+                {
+                    new_rotation = yaw_increment * current_rotation;
+                }
+                GetEntity()->SetRotationLocal(new_rotation.Normalized());
             }
-            GetEntity()->SetRotationLocal(new_rotation.Normalized());
     
             // Keyboard and gamepad movement direction
             if (is_controlled)
@@ -673,8 +815,9 @@ namespace spartan
             physics_body->Crouch(is_crouching);
         }
         
-        // behavior: apply movement
-        if (m_movement_speed != Vector3::Zero || (has_physics_body && is_playing && is_grounded))
+        // behavior: apply movement (skip during focus lerp - the lerp controls the camera)
+        bool is_focus_lerping = m_lerp_to_target_p || m_lerp_to_target_r;
+        if (!is_focus_lerping && (m_movement_speed != Vector3::Zero || (has_physics_body && is_playing && is_grounded)))
         {
             if (has_physics_body && is_playing)
             {
@@ -698,6 +841,13 @@ namespace spartan
             else if (has_physics_body)
             {
                 physics_body->Move(m_movement_speed);
+
+                // keep the camera at eye height on the controller capsule so flying in
+                // editor mode doesn't let the local offset drift from the proper position
+                if (physics_body->GetBodyType() == BodyType::Controller)
+                {
+                    GetEntity()->SetPositionLocal(physics_body->GetControllerTopLocal());
+                }
             }
             else
             {
@@ -706,56 +856,7 @@ namespace spartan
         }
 
         // behavior: flashlight
-        {
-            // create flashlight entity once
-            if (!m_flashlight)
-            {
-                // entity
-                m_flashlight = World::CreateEntity();
-                m_flashlight->SetObjectName("flashlight");
-                m_flashlight->SetTransient(true); // don't serialize - dynamically created
-                m_flashlight->SetParent(GetEntity());
-                m_flashlight->SetRotationLocal(Quaternion::Identity);
-
-                // component
-                Light* light = m_flashlight->AddComponent<Light>();
-                light->SetLightType(LightType::Spot);
-                light->SetColor(Color(1.0f, 1.0f, 1.0f, 1.0f));
-                light->SetRange(100.0f);
-                light->SetIntensity(2000.0f);
-                light->SetAngle(30.0f * math::deg_to_rad);
-                light->SetFlag(LightFlags::Volumetric, false);
-                light->SetFlag(LightFlags::ShadowsScreenSpace, false);
-                light->SetFlag(LightFlags::Shadows, true);
-            }
-
-            // toggle
-            if (button_flashlight && is_playing)
-            {
-                SetFlag(CameraFlags::Flashlight, !GetFlag(CameraFlags::Flashlight));
-            }
-
-            // ensure flashlight follows camera and respects active state
-            if (m_flashlight)
-            {
-                // ensure parent is set (in case camera entity was recreated)
-                if (m_flashlight->GetParent() != GetEntity())
-                {
-                    m_flashlight->SetParent(GetEntity());
-                    m_flashlight->SetRotationLocal(Quaternion::Identity);
-                }
-
-                // set active state and intensity based on flag
-                bool flashlight_enabled = GetFlag(CameraFlags::Flashlight);
-                m_flashlight->SetActive(flashlight_enabled);
-                
-                if (Light* light = m_flashlight->GetComponent<Light>())
-                {
-                    // set intensity to 0 when off, restore to 2000 when on
-                    light->SetIntensity(flashlight_enabled ? 2000.0f : 0.0f);
-                }
-            }
-        }
+        update_flashlight();
 
         // behaviour: shoot (physics boxes for now)
         if (mouse_click_left_down && mouse_click_right && mouse_in_viewport && is_playing)
@@ -769,7 +870,7 @@ namespace spartan
             entity->SetPosition(GetEntity()->GetPosition() + spawn_offset);
 
             // give it a mesh and a material
-            Renderable* renderable = entity->AddComponent<Renderable>();
+            Render* renderable = entity->AddComponent<Render>();
             renderable->SetMesh(MeshType::Cube);
             renderable->SetDefaultMaterial();
 
@@ -796,25 +897,24 @@ namespace spartan
         // lerp
         if (m_lerp_to_target_p || m_lerp_to_target_r)
         {
-            // lerp duration in seconds
-            // 2.0 seconds + [0.0 - 2.0] seconds based on distance
-            // Something is not right with the duration...
+            // lerp duration: 2.0 seconds + [0.0 - 2.0] seconds based on distance
             const float lerp_duration = 2.0f + clamp(m_lerp_to_target_distance * 0.01f, 0.0f, 2.0f);
 
             // alpha
             m_lerp_to_target_alpha += static_cast<float>(Timer::GetDeltaTimeSec()) / lerp_duration;
+            float alpha = clamp(m_lerp_to_target_alpha, 0.0f, 1.0f);
 
-            // position
+            // position - interpolate between the stored start and target (fixed endpoints)
             if (m_lerp_to_target_p)
             {
-                const Vector3 interpolated_position = Vector3::Lerp(GetEntity()->GetPosition(), m_lerp_to_target_position, m_lerp_to_target_alpha);
+                const Vector3 interpolated_position = Vector3::Lerp(m_lerp_from_position, m_lerp_to_target_position, alpha);
                 GetEntity()->SetPosition(interpolated_position);
             }
 
-            // rotation
+            // rotation - interpolate between the stored start and target (fixed endpoints)
             if (m_lerp_to_target_r)
             {
-                const Quaternion interpolated_rotation = Quaternion::Lerp(GetEntity()->GetRotation(), m_lerp_to_target_rotation, clamp(m_lerp_to_target_alpha, 0.0f, 1.0f));
+                const Quaternion interpolated_rotation = Quaternion::Lerp(m_lerp_from_rotation, m_lerp_to_target_rotation, alpha);
                 GetEntity()->SetRotation(interpolated_rotation);
             }
 
@@ -825,6 +925,7 @@ namespace spartan
                 m_lerp_to_target_r        = false;
                 m_lerp_to_target_alpha    = 0.0f;
                 m_lerp_to_target_position = Vector3::Zero;
+                m_movement_speed          = Vector3::Zero;
             }
         }
     }
@@ -844,7 +945,7 @@ namespace spartan
 
             // if the entity has a renderable component, we can get a more accurate target position
             // ...otherwise we apply a simple offset so that the rotation vector doesn't suffer
-            if (Renderable* renderable = entity->GetComponent<Renderable>())
+            if (Render* renderable = entity->GetComponent<Render>())
             {
                 m_lerp_to_target_position -= target_direction * renderable->GetBoundingBox().GetExtents().Length() * 2.0f;
             }
@@ -854,10 +955,15 @@ namespace spartan
             }
             SP_ASSERT(!isnan(m_lerp_to_target_distance));
 
+            // store start state so the lerp interpolates between two fixed endpoints
+            m_lerp_from_position      = GetEntity()->GetPosition();
+            m_lerp_from_rotation      = GetEntity()->GetRotation();
+            m_lerp_to_target_alpha    = 0.0f;
+            m_movement_speed          = Vector3::Zero;
             m_lerp_to_target_rotation = Quaternion::FromLookRotation(entity->GetPosition() - m_lerp_to_target_position).Normalized();
-            m_lerp_to_target_distance = Vector3::Distance(m_lerp_to_target_position, GetEntity()->GetPosition());
+            m_lerp_to_target_distance = Vector3::Distance(m_lerp_to_target_position, m_lerp_from_position);
 
-            const float lerp_angle = acosf(Quaternion::Dot(m_lerp_to_target_rotation.Normalized(), GetEntity()->GetRotation().Normalized())) * rad_to_deg;
+            const float lerp_angle = acosf(Quaternion::Dot(m_lerp_to_target_rotation.Normalized(), m_lerp_from_rotation.Normalized())) * rad_to_deg;
 
             m_lerp_to_target_p = m_lerp_to_target_distance > 0.1f ? true : false;
             m_lerp_to_target_r = lerp_angle > 1.0f ? true : false;

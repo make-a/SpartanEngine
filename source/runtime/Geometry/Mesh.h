@@ -24,26 +24,38 @@ CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 //= INCLUDES =====================
 #include <vector>
 #include <mutex>
+#include <memory>
 #include "../RHI/RHI_Vertex.h"
 #include "../Resource/IResource.h"
 #include "../Math/BoundingBox.h"
+#include "../Rendering/Renderer_Buffers.h"
+#include "../Rendering/Animation/AnimationClip.h"
+#include "../Rendering/Animation/SkeletalMeshBinding.h"
 //================================
+
+namespace sol
+{
+    class state_view;
+}
 
 namespace spartan
 {
+    class Entity;
     class RHI_Buffer;
     class RHI_AccelerationStructure;
     class RHI_CommandList;
+    struct Skeleton;
 
     enum class MeshFlags : uint32_t
     {
         ImportRemoveRedundantData       = 1 << 0,
         ImportLights                    = 1 << 1,
         ImportCombineMeshes             = 1 << 2,
-        PostProcessNormalizeScale       = 1 << 3,
-        PostProcessOptimize             = 1 << 4,
-        PostProcessGenerateLods         = 1 << 5,
-        PostProcessPreserveTerrainEdges = 1 << 6,
+        ImportGenerateSmoothNormals     = 1 << 3,
+        PostProcessNormalizeScale       = 1 << 4,
+        PostProcessOptimize             = 1 << 5,
+        PostProcessGenerateLods         = 1 << 6,
+        PostProcessPreserveTerrainEdges = 1 << 7,
     };
 
     enum class MeshType
@@ -58,11 +70,13 @@ namespace spartan
 
     struct MeshLod
     {
-        uint32_t vertex_offset; // starting offset in m_vertices
-        uint32_t vertex_count;  // number of vertices for this LOD
-        uint32_t index_offset;  // starting offset in m_indices
-        uint32_t index_count;   // number of indices for this LOD
-        math::BoundingBox aabb; // bounding box of this LOD
+        uint32_t vertex_offset;  // starting offset in m_vertices
+        uint32_t vertex_count;   // number of vertices for this LOD
+        uint32_t index_offset;   // starting offset in m_indices
+        uint32_t index_count;    // number of indices for this LOD
+        math::BoundingBox aabb;  // bounding box of this LOD
+        uint32_t meshlet_offset; // starting offset in m_meshlets (per-mesh local)
+        uint32_t meshlet_count;  // number of meshlets covering this lod
     };
     static const uint32_t mesh_lod_count = 5;
 
@@ -77,6 +91,8 @@ namespace spartan
         Mesh();
         ~Mesh();
 
+        static void RegisterForScripting(sol::state_view State);
+
         // iresource
         void SaveToFile(const std::string& file_path) override;
         void LoadFromFile(const std::string& file_path) override;
@@ -87,9 +103,10 @@ namespace spartan
         uint32_t GetMemoryUsage() const;
         void AddLod(std::vector<RHI_Vertex_PosTexNorTan>& vertices, std::vector<uint32_t>& indices, const uint32_t sub_mesh_index);
         void AddGeometry(std::vector<RHI_Vertex_PosTexNorTan>& vertices, std::vector<uint32_t>& indices, const bool generate_lods, uint32_t* sub_mesh_index = nullptr);
-        std::vector<RHI_Vertex_PosTexNorTan>& GetVertices()   { return m_vertices; }
-        std::vector<uint32_t>& GetIndices()                   { return m_indices; }
-        const SubMesh& GetSubMesh(const uint32_t index) const { return m_sub_meshes[index]; }
+        std::vector<RHI_Vertex_PosTexNorTan>& GetVertices()    { return m_vertices; }
+        std::vector<uint32_t>& GetIndices()                    { return m_indices; }
+        const SubMesh& GetSubMesh(const uint32_t index) const  { return m_sub_meshes[index]; }
+        const std::vector<Sb_MeshletBounds>& GetMeshlets() const { return m_meshlets; }
 
         // get counts
         uint32_t GetVertexCount() const;
@@ -97,9 +114,14 @@ namespace spartan
 
         // gpu buffers
         void CreateGpuBuffers();
-        void BuildAccelerationStructure(RHI_CommandList* cmd_list);
-        RHI_Buffer* GetIndexBuffer()  { return m_index_buffer.get();  }
-        RHI_Buffer* GetVertexBuffer() { return m_vertex_buffer.get(); }
+        void BuildAccelerationStructure(RHI_CommandList* cmd_list, bool allow_update = false);
+        RHI_Buffer* GetIndexBuffer();
+        RHI_Buffer* GetVertexBuffer();
+
+        // global geometry buffer offsets
+        uint32_t GetGlobalVertexOffset() const  { return m_global_vertex_offset; }
+        uint32_t GetGlobalIndexOffset() const   { return m_global_index_offset; }
+        uint32_t GetGlobalMeshletOffset() const { return m_global_meshlet_offset; }
 
         // root entity
         Entity* GetRootEntity() { return m_root_entity; }
@@ -113,24 +135,47 @@ namespace spartan
         uint32_t GetFlags() const { return m_flags; }
         static uint32_t GetDefaultFlags();
 
+        // skinning data model split
+        void SetSkeleton(const std::shared_ptr<Skeleton>& skeleton) { m_skeleton = skeleton; }
+        const std::shared_ptr<Skeleton>& GetSkeleton() const { return m_skeleton; }
+        void SetSkeletalMeshBinding(std::unique_ptr<SkeletalMeshBinding> binding) { m_skeletal_mesh_binding = std::move(binding); }
+        SkeletalMeshBinding* GetSkeletalMeshBinding() { return m_skeletal_mesh_binding.get(); }
+        const SkeletalMeshBinding* GetSkeletalMeshBinding() const { return m_skeletal_mesh_binding.get(); }
+        bool IsSkinned() const { return m_skeleton != nullptr && m_skeletal_mesh_binding != nullptr; }
+
+        // animation clips
+        void AddAnimationClip(AnimationClip clip)                          { m_animation_clips.push_back(std::move(clip)); }
+        const std::vector<AnimationClip>& GetAnimationClips() const        { return m_animation_clips; }
+        uint32_t GetAnimationClipCount() const                             { return static_cast<uint32_t>(m_animation_clips.size()); }
+
         // acceleration structure - one blas per sub-mesh to avoid shared geometry issues
         RHI_AccelerationStructure* GetBlas(uint32_t sub_mesh_index) const;
         bool HasBlas(uint32_t sub_mesh_index) const;
+        void InvalidateBlas(uint32_t sub_mesh_index);
+        void RefitBlas(RHI_CommandList* cmd_list, uint32_t sub_mesh_index);
+        bool CanRefitBlas(uint32_t sub_mesh_index) const;
 
     private:
         // geometry
         std::vector<RHI_Vertex_PosTexNorTan> m_vertices; // all vertices of a model file
         std::vector<uint32_t> m_indices;                 // all indices of a model file
         std::vector<SubMesh> m_sub_meshes;               // tracks sub-meshes and lods within the above vectors
+        std::vector<Sb_MeshletBounds> m_meshlets;        // per-lod meshlet bounding spheres + index ranges
 
-        // gpu buffers
-        std::unique_ptr<RHI_Buffer> m_vertex_buffer;
-        std::unique_ptr<RHI_Buffer> m_index_buffer;
+        // global geometry buffer offsets (base offsets into the shared vertex/index/meshlet buffers)
+        uint32_t m_global_vertex_offset  = 0;
+        uint32_t m_global_index_offset   = 0;
+        uint32_t m_global_meshlet_offset = 0;
+
+        // acceleration structures
         std::vector<std::unique_ptr<RHI_AccelerationStructure>> m_blas; // one blas per sub-mesh
 
         // misc
         std::mutex m_mutex;
         Entity* m_root_entity = nullptr;
         MeshType m_type       = MeshType::Max;
+        std::shared_ptr<Skeleton> m_skeleton;
+        std::unique_ptr<SkeletalMeshBinding> m_skeletal_mesh_binding;
+        std::vector<AnimationClip> m_animation_clips;
     };
 }

@@ -45,6 +45,27 @@ static const uint  THREAD_GROUP_COUNT_X = 8;
 static const uint  THREAD_GROUP_COUNT_Y = 8;
 static const uint  THREAD_GROUP_COUNT   = 64;
 static const float DEG_TO_RAD           = PI / 180.0f;
+static const float LUMINOUS_EFFICACY_MAX = 683.0f;
+
+float radiometric_to_photometric(float value)
+{
+    return value * LUMINOUS_EFFICACY_MAX;
+}
+
+float3 radiometric_to_photometric(float3 value)
+{
+    return value * LUMINOUS_EFFICACY_MAX;
+}
+
+float photometric_to_radiometric(float value)
+{
+    return value / LUMINOUS_EFFICACY_MAX;
+}
+
+float3 photometric_to_radiometric(float3 value)
+{
+    return value / LUMINOUS_EFFICACY_MAX;
+}
 
 /*------------------------------------------------------------------------------
     SATURATE
@@ -148,12 +169,12 @@ float fast_acos(float in_x)
 ------------------------------------------------------------------------------*/
 float3 world_to_view(float3 x, bool is_position = true)
 {
-    return mul(float4(x, (float)is_position), buffer_frame.view).xyz;
+    return mul(float4(x, (float)is_position), get_view()).xyz;
 }
 
 float3 world_to_ndc(float3 x, bool is_position = true)
 {
-    float4 ndc = mul(float4(x, (float)is_position), buffer_frame.view_projection);
+    float4 ndc = mul(float4(x, (float)is_position), get_view_projection());
     return ndc.xyz / ndc.w;
 }
 
@@ -165,24 +186,24 @@ float3 world_to_ndc(float3 x, float4x4 transform) // shadow mapping
 
 float3 view_to_ndc(float3 x, bool is_position = true)
 {
-    float4 ndc = mul(float4(x, (float)is_position), buffer_frame.projection);
+    float4 ndc = mul(float4(x, (float)is_position), get_projection());
     return ndc.xyz / ndc.w;
 }
 
 float2 world_to_uv(float3 x, bool is_position = true)
 {
-    float4 uv = mul(float4(x, (float)is_position), buffer_frame.view_projection);
+    float4 uv = mul(float4(x, (float)is_position), get_view_projection());
     return (uv.xy / uv.w) * float2(0.5f, -0.5f) + 0.5f;
 }
 
 float3 view_to_world(float3 x, bool is_position = true)
 {
-     return mul(float4(x, (float)is_position), buffer_frame.view_inverted).xyz;
+     return mul(float4(x, (float)is_position), get_view_inverted()).xyz;
 }
 
 float2 view_to_uv(float3 x, bool is_position = true)
 {
-    float4 uv = mul(float4(x, (float)is_position), buffer_frame.projection);
+    float4 uv = mul(float4(x, (float)is_position), get_projection());
     return (uv.xy / uv.w) * float2(0.5f, -0.5f) + 0.5f;
 }
 
@@ -201,6 +222,34 @@ float2 uv_to_ndc(float2 uv)
     return float2(uv.x * 2.0f - 1.0f, 1.0f - uv.y * 2.0f); // flip y for dx style
 }
 
+// rotate uv in 90 degree increments: 0 = 0, 1 = 90, 2 = 180, 3 = 270
+float2 rotate_uv_90(float2 uv, float rotation_index)
+{
+    uint r = uint(rotation_index) & 3;
+    float2 centered = uv - 0.5f;
+    float2 rotated  = centered;
+    if (r == 1)      rotated = float2(-centered.y,  centered.x); // 90 ccw
+    else if (r == 2) rotated = float2(-centered.x, -centered.y); // 180
+    else if (r == 3) rotated = float2( centered.y, -centered.x); // 270 ccw
+    return rotated + 0.5f;
+}
+
+float2 compute_world_space_uv(float3 position_world, float3 normal_world)
+{
+    float3 normal = normalize(normal_world);
+    float3 axis_v = float3(0.0f, 1.0f, 0.0f) - normal * dot(float3(0.0f, 1.0f, 0.0f), normal);
+
+    // horizontal surfaces need a second reference axis because world up collapses onto the normal.
+    if (dot(axis_v, axis_v) < 1e-4f)
+        axis_v = float3(0.0f, 0.0f, -1.0f) - normal * dot(float3(0.0f, 0.0f, -1.0f), normal);
+
+    axis_v = normalize(axis_v);
+
+    // keep v aligned with world up on walls and slopes, while u follows the surface plane.
+    float3 axis_u = normalize(cross(axis_v, normal));
+
+    return float2(dot(position_world, axis_u), dot(position_world, axis_v));
+}
 
 /*------------------------------------------------------------------------------
     NORMAL
@@ -228,12 +277,12 @@ float3 get_normal(float2 uv)
 
 float3 get_normal_view_space(uint2 pos)
 {
-    return normalize(mul(float4(get_normal(pos), 0.0f), buffer_frame.view).xyz);
+    return normalize(mul(float4(get_normal(pos), 0.0f), get_view()).xyz);
 }
 
 float3 get_normal_view_space(float2 uv)
 {
-    return normalize(mul(float4(get_normal(uv), 0.0f), buffer_frame.view).xyz);
+    return normalize(mul(float4(get_normal(uv), 0.0f), get_view()).xyz);
 }
 
 float3x3 make_tangent_to_world_matrix(float3 n, float3 t)
@@ -291,29 +340,40 @@ float3 get_position(float z, float2 uv)
     float x          = uv.x * 2.0f - 1.0f;
     float y          = (1.0f - uv.y) * 2.0f - 1.0f;
     float4 pos_clip  = float4(x, y, z, 1.0f);
-    float4 pos_world = mul(pos_clip, buffer_frame.view_projection_inverted);
+    float4 pos_world = mul(pos_clip, get_view_projection_inverted());
+    return pos_world.xyz / pos_world.w;
+}
+
+// explicit-view overload: used by raster pixel shaders in multiview passes where the per-fragment
+// eye must be selected via SV_ViewID rather than the (static) buffer_pass.eye_index push constant.
+float3 get_position_for_view(float z, float2 uv, uint view_id)
+{
+    float x          = uv.x * 2.0f - 1.0f;
+    float y          = (1.0f - uv.y) * 2.0f - 1.0f;
+    float4 pos_clip  = float4(x, y, z, 1.0f);
+    float4 pos_world = mul(pos_clip, get_view_projection_inverted_for_view(view_id));
     return pos_world.xyz / pos_world.w;
 }
 
 float3 get_position(float2 uv)
 {
-    return get_position(get_depth(uv), uv);
+    return get_position(get_depth(uv), uv / buffer_frame.resolution_scale);
 }
 
 float3 get_position(uint2 pos)
 {
-    const float2 uv = (pos + 0.5f) / buffer_frame.resolution_render;
+    const float2 uv = (pos + 0.5f) / (buffer_frame.resolution_render * buffer_frame.resolution_scale);
     return get_position(get_depth(pos), uv);
 }
 
 float3 get_position_view_space(uint2 pos)
 {
-    return mul(float4(get_position(pos), 1.0f), buffer_frame.view).xyz;
+    return mul(float4(get_position(pos), 1.0f), get_view()).xyz;
 }
 
 float3 get_position_view_space(float2 uv)
 {
-    return mul(float4(get_position(uv), 1.0f), buffer_frame.view).xyz;
+    return mul(float4(get_position(get_depth(uv), uv / buffer_frame.resolution_scale), 1.0f), get_view()).xyz;
 }
 
 /*------------------------------------------------------------------------------
@@ -334,7 +394,7 @@ float2 get_velocity_uv(float2 uv)
 ------------------------------------------------------------------------------*/
 float3 get_view_direction(float3 position_world)
 {
-    return normalize(position_world - buffer_frame.camera_position.xyz);
+    return normalize(position_world - get_camera_position());
 }
 
 float3 get_view_direction(float depth, float2 uv)
@@ -344,7 +404,7 @@ float3 get_view_direction(float depth, float2 uv)
 
 float3 get_view_direction(float2 uv)
 {
-    return get_view_direction(get_position(uv));
+    return get_view_direction(get_position(get_depth(uv), uv / buffer_frame.resolution_scale));
 }
 
 float3 get_view_direction(uint2 pos, float2 resolution)
@@ -355,7 +415,7 @@ float3 get_view_direction(uint2 pos, float2 resolution)
 
 float3 get_view_direction_view_space(float2 uv)
 {
-    return mul(float4(get_view_direction(get_position(uv)), 0.0f), buffer_frame.view).xyz;
+    return mul(float4(get_view_direction(get_position(get_depth(uv), uv / buffer_frame.resolution_scale)), 0.0f), get_view()).xyz;
 }
 
 float3 get_view_direction_view_space(uint2 pos, float2 resolution)
@@ -366,7 +426,7 @@ float3 get_view_direction_view_space(uint2 pos, float2 resolution)
 
 float3 get_view_direction_view_space(float3 position_world)
 {
-    return mul(float4(get_view_direction(position_world), 0.0f), buffer_frame.view).xyz;
+    return mul(float4(get_view_direction(position_world), 0.0f), get_view()).xyz;
 }
 
 /*------------------------------------------------------------------------------
@@ -567,7 +627,7 @@ float get_alpha_threshold(float3 position_world)
     static const float ALPHA_MAX_DISTANCE_SQ = ALPHA_MAX_DISTANCE * ALPHA_MAX_DISTANCE;
 
     // beyond max distance, no alpha testing (threshold = 0)
-    float3 offset           = position_world - buffer_frame.camera_position;
+    float3 offset           = position_world - get_camera_position();
     float pixel_distance_sq = dot(offset, offset);
     float distance_factor   = step(ALPHA_MAX_DISTANCE_SQ, pixel_distance_sq);
     

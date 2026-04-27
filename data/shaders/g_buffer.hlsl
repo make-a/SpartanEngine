@@ -30,7 +30,7 @@ struct gbuffer
     float2 velocity : SV_Target3;
 };
 
-//= CONSTANTS =====================
+// constants
 static const float3 vegetation_greener  = float3(0.05f, 0.4f, 0.03f);
 static const float3 vegetation_yellower = float3(0.45f, 0.4f, 0.15f);
 static const float3 vegetation_browner  = float3(0.3f, 0.15f, 0.08f);
@@ -43,7 +43,6 @@ static const float3 flower_blue         = float3(0.529f, 0.808f, 0.922f);
 static const float3 flower_red          = float3(0.8f, 0.2f, 0.2f);
 static const float3 flower_yellow       = float3(0.9f, 0.8f, 0.1f);
 static const float3 snow_color          = float3(0.95f, 0.95f, 0.95f);
-//=================================
 
 // rotate uv around center (0.5, 0.5) by angle
 static float2 rotate_uv(float2 uv, float angle)
@@ -112,16 +111,30 @@ float3 compute_flower_color(float height_percent, uint instance_id)
     return lerp(flower_base, tip, smoothstep(0.2f, 1.0f, height_percent));
 }
 
-gbuffer_vertex main_vs(Vertex_PosUvNorTan input, uint instance_id : SV_InstanceID)
+#ifdef INDIRECT_DRAW
+gbuffer_vertex main_vs(uint vertex_id : SV_VertexID, uint view_id : SV_ViewID)
 {
+    MeshletInstance mi;
+    Vertex_PosUvNorTan input = pull_visible_triangle_vertex(vertex_id, mi);
+    uint instance_id         = mi.instance_index;
+#else
+gbuffer_vertex main_vs(Vertex_PosUvNorTan input, uint instance_id : SV_InstanceID, uint view_id : SV_ViewID)
+{
+    _draw = draw_data[buffer_pass.draw_index];
+#endif
+
     float3 position_world          = 0.0f;
     float3 position_world_previous = 0.0f;
-    gbuffer_vertex vertex          = transform_to_world_space(input, instance_id, buffer_pass.transform, position_world, position_world_previous);
-    return transform_to_clip_space(vertex, position_world, position_world_previous);
+    gbuffer_vertex vertex          = transform_to_world_space(input, instance_id, _draw.transform, position_world, position_world_previous);
+    vertex.material_index          = _draw.material_index;
+    return transform_to_clip_space(vertex, position_world, position_world_previous, view_id);
 }
 
 gbuffer main_ps(gbuffer_vertex vertex, bool is_front_face : SV_IsFrontFace)
 {
+    // restore material index from vertex output (works for both indirect and cpu-driven draws)
+    pass_load_draw_data_from_vertex(vertex.material_index);
+
     // material setup
     MaterialParameters material = GetMaterial();
     Surface surface;
@@ -143,22 +156,27 @@ gbuffer main_ps(gbuffer_vertex vertex, bool is_front_face : SV_IsFrontFace)
     float2 velocity              = position_ndc - position_ndc_previous;
     
     // world position and distance
-    float3 position_world  = get_position(vertex.position.z, ndc_to_uv(position_ndc_jittered));
-    float3 camera_to_pixel = position_world - buffer_frame.camera_position;
+    // in multiview the g-buffer is drawn in a single call for both eyes, so buffer_pass.eye_index
+    // is static and cannot be used to pick the right eye's inverse vp. drive the per-fragment
+    // eye from the interpolated SV_ViewID (vertex.view_id) instead.
+    float3 position_world  = get_position_for_view(vertex.position.z, ndc_to_uv(position_ndc_jittered), vertex.view_id);
+    float3 camera_to_pixel = position_world - get_camera_position_for_view(vertex.view_id);
     float distance         = fast_sqrt(dot(camera_to_pixel, camera_to_pixel));
 
     // world space uv transformation
     if (any(material.world_space_uv))
     {
-        float3 abs_normal = abs(normal);
-        float2 uv_world   = position_world.yz * abs_normal.x + 
-                            position_world.xz * abs_normal.y + 
-                            position_world.xy * abs_normal.z;
-        uv_world          = uv_world * material.tiling + material.offset;
+        float2 uv_world = compute_world_space_uv(position_world, normal);
+        uv_world        = uv_world * material.tiling + material.offset;
         
         // branchless inversion
         float2 invert_mask = step(0.5f, material.invert_uv);
-        vertex.uv_misc.xy  = lerp(uv_world, 1.0f - frac(uv_world) + floor(uv_world), invert_mask);
+        uv_world           = lerp(uv_world, 1.0f - frac(uv_world) + floor(uv_world), invert_mask);
+
+        if (material.uv_rotation != 0.0f)
+            uv_world = rotate_uv_90(uv_world, material.uv_rotation);
+
+        vertex.uv_misc.xy = uv_world;
     }
 
     // albedo sampling

@@ -49,23 +49,27 @@ namespace spartan
         // descriptors
         static void AllocateDescriptorSet(void*& resource, RHI_DescriptorSetLayout* descriptor_set_layout, const std::vector<RHI_DescriptorWithBinding>& descriptors);
         static std::unordered_map<uint64_t, RHI_DescriptorSet>& GetDescriptorSets();
+        static uint64_t GetDescriptorSetFrame();
         static void* GetDescriptorSet(const RHI_Device_Bindless_Resource resource_type);
         static void* GetDescriptorSetLayout(const RHI_Device_Bindless_Resource resource_type);
-        static void UpdateBindlessResources(
-            std::array<RHI_Texture*, rhi_max_array_size>* material_textures,
-            RHI_Buffer* material_parameters,
-            RHI_Buffer* light_parameters,
-            const std::array<std::shared_ptr<RHI_Sampler>, static_cast<uint32_t>(Renderer_Sampler::Max)>* samplers,
-            RHI_Buffer* bindless_aabbs
-        );
+        static void UpdateBindlessMaterials(std::array<RHI_Texture*, rhi_max_array_size>* textures, RHI_Buffer* parameters);
+        static void UpdateBindlessLights(RHI_Buffer* parameters);
+        static void UpdateBindlessSamplers(const std::array<std::shared_ptr<RHI_Sampler>, static_cast<uint32_t>(Renderer_Sampler::Max)>* samplers);
+        static void UpdateBindlessAABBs(RHI_Buffer* buffer);
+        static void UpdateBindlessDrawData(RHI_Buffer* buffer);
+        static void UpdateBindlessGeometryVertices(RHI_Buffer* buffer);
+        static void UpdateBindlessGeometryIndices(RHI_Buffer* buffer);
+        static void UpdateBindlessInstances(RHI_Buffer* buffer);
 
         // pipelines
         static void GetOrCreatePipeline(RHI_PipelineState& pso, RHI_Pipeline*& pipeline, RHI_DescriptorSetLayout*& descriptor_set_layout);
         static uint32_t GetPipelineCount();
+        static void* GetPipelineCache();
 
         // deletion queue
         static void DeletionQueueAdd(const RHI_Resource_Type resource_type, void* resource);
         static void DeletionQueueParse();
+        static void DeletionQueueFlush();
         static bool DeletionQueueNeedsToParse();
 
         // memory
@@ -79,6 +83,11 @@ namespace spartan
         static uint64_t MemoryGetAllocatedMb();
         static uint64_t MemoryGetAvailableMb();
         static uint64_t MemoryGetTotalMb();
+
+        // staging buffer pool - avoids per-upload allocation churn
+        static void* StagingBufferAcquire(uint64_t size);
+        static void StagingBufferRelease(void* buffer);
+        static void StagingBufferPoolDestroy();
 
         // properties (actual silicon properties)
         static float PropertyGetTimestampPeriod()                         { return m_timestamp_period; }
@@ -109,6 +118,10 @@ namespace spartan
         static void PhysicalDeviceRegister(const RHI_PhysicalDevice& physical_device);
         static void PhysicalDeviceSetPrimary(const uint32_t index);
         static std::vector<RHI_PhysicalDevice>& PhysicalDeviceGet();
+
+        // device state
+        static bool IsDeviceLost()  { return m_device_lost; }
+        static void SetDeviceLost() { m_device_lost = true; }
 
         // misc
         static uint64_t GetBufferDeviceAddress(void* buffer);
@@ -142,6 +155,7 @@ namespace spartan
 
         // misc
         static bool m_wide_lines;
+        static bool m_device_lost;
         static uint32_t m_physical_device_index;
     };
 }

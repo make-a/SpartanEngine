@@ -137,6 +137,7 @@ namespace spartan
                 }
 
                 hash = rhi_hash_combine(hash, pso.render_target_array_index);
+                hash = rhi_hash_combine(hash, static_cast<uint64_t>(pso.is_multiview));
             }
 
             return hash;
@@ -167,9 +168,8 @@ namespace spartan
 
             if (pso.resolution_scale)
             { 
-                float resolution_scale = cvar_resolution_scale.GetValue();
-                *width                 = static_cast<uint32_t>(*width * resolution_scale);
-                *height                = static_cast<uint32_t>(*height * resolution_scale);
+                *width  = Renderer::GetScaledDimension(*width);
+                *height = Renderer::GetScaledDimension(*height);
             }
         }
     }

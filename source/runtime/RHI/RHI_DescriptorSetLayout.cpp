@@ -22,6 +22,7 @@ CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 //= INCLUDES =======================
 #include "pch.h"
 #include "RHI_DescriptorSetLayout.h"
+#include "RHI_AccelerationStructure.h"
 #include "RHI_Buffer.h"
 #include "RHI_Texture.h"
 #include "RHI_DescriptorSet.h"
@@ -99,7 +100,7 @@ namespace spartan
         }
     }
 
-    void RHI_DescriptorSetLayout::SetTexture(uint32_t slot, RHI_Texture* texture, uint32_t mip_index, uint32_t mip_range)
+    void RHI_DescriptorSetLayout::SetTexture(uint32_t slot, RHI_Texture* texture, uint32_t mip_index, uint32_t mip_range, uint32_t array_layer /*= rhi_all_mips*/)
     {
         bool mip_specified      = mip_index != rhi_all_mips;
         RHI_Image_Layout layout = texture->GetLayout(mip_specified ? mip_index : 0);
@@ -112,10 +113,11 @@ namespace spartan
 
         if (RHI_DescriptorBinding* binding = FindBinding(actual_slot))
         {
-            binding->resource  = static_cast<void*>(texture);
-            binding->layout    = layout;
-            binding->mip       = mip_index;
-            binding->mip_range = mip_range;
+            binding->resource    = static_cast<void*>(texture);
+            binding->layout      = layout;
+            binding->mip         = mip_index;
+            binding->mip_range   = mip_range;
+            binding->array_layer = array_layer;
             m_dirty = true;
         }
     }
@@ -126,6 +128,7 @@ namespace spartan
         if (RHI_DescriptorBinding* binding = FindBinding(actual_slot))
         {
             binding->resource = static_cast<void*>(tlas);
+            binding->range    = tlas ? reinterpret_cast<uint64_t>(tlas->GetRhiResource()) : 0;
             m_dirty = true;
         }
     }
@@ -180,6 +183,7 @@ namespace spartan
             it = descriptor_sets.find(m_binding_hash);
         }
 
+        it->second.MarkUsed(RHI_Device::GetDescriptorSetFrame());
         return it->second.GetResource();
     }
 

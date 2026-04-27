@@ -32,6 +32,7 @@ CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 #include "../Commands/Console/ConsoleCommands.h"
 #include <unordered_map>
 #include <atomic>
+#include <string>
 #include "../Math/Rectangle.h"
 //==============================================
 
@@ -41,14 +42,14 @@ namespace spartan
     class Entity;
     class Camera;
     class Light;
-    class Renderable;
+    class Render;
     namespace math
     {
         class BoundingBox;
         class Frustum;
     }
 
-    // console varibales
+    // console variables
     extern TConsoleVar<float> cvar_aabb;
     extern TConsoleVar<float> cvar_picking_ray;
     extern TConsoleVar<float> cvar_grid;
@@ -65,6 +66,8 @@ namespace spartan
     extern TConsoleVar<float> cvar_ray_traced_reflections;
     extern TConsoleVar<float> cvar_ray_traced_shadows;
     extern TConsoleVar<float> cvar_restir_pt;
+    extern TConsoleVar<float> cvar_restir_pt_scale;
+    extern TConsoleVar<float> cvar_restir_pt_debug_mode;
     extern TConsoleVar<float> cvar_motion_blur;
     extern TConsoleVar<float> cvar_depth_of_field;
     extern TConsoleVar<float> cvar_film_grain;
@@ -81,18 +84,12 @@ namespace spartan
     extern TConsoleVar<float> cvar_variable_rate_shading;
     extern TConsoleVar<float> cvar_resolution_scale;
     extern TConsoleVar<float> cvar_dynamic_resolution;
-    extern TConsoleVar<float> cvar_occlusion_culling;
+    extern TConsoleVar<float> cvar_hiz_occlusion;
+    extern TConsoleVar<float> cvar_meshlet_cull_skinned;
+    extern TConsoleVar<float> cvar_meshlet_visualize;
     extern TConsoleVar<float> cvar_auto_exposure_adaptation_speed;
-    extern TConsoleVar<float> cvar_clouds_enabled;
-    extern TConsoleVar<float> cvar_cloud_animation;
     extern TConsoleVar<float> cvar_cloud_coverage;
-    extern TConsoleVar<float> cvar_cloud_type;
     extern TConsoleVar<float> cvar_cloud_shadows;
-    extern TConsoleVar<float> cvar_cloud_color_r;
-    extern TConsoleVar<float> cvar_cloud_color_g;
-    extern TConsoleVar<float> cvar_cloud_color_b;
-    extern TConsoleVar<float> cvar_cloud_darkness;
-    extern TConsoleVar<float> cvar_cloud_seed;
 
     struct ShadowSlice
     {
@@ -119,8 +116,7 @@ namespace spartan
         static void Shutdown();
         static void Tick();
 
-        // primitive rendering (development & debugging)
-        // duration_sec: 0.0f = single frame, > 0.0 = seconds to display, FLT_MAX = infinite
+        // debug primitives (duration: 0 = one frame, > 0 = seconds, FLT_MAX = forever)
         static void DrawLine(const math::Vector3& from, const math::Vector3& to, const Color& color_from = Color::standard_renderer_lines, const Color& color_to = Color::standard_renderer_lines, float duration_sec = 0.0f);
         static void DrawTriangle(const math::Vector3& v0, const math::Vector3& v1, const math::Vector3& v2, const Color& color = Color::standard_renderer_lines, float duration_sec = 0.0f);
         static void DrawBox(const math::BoundingBox& box, const Color& color = Color::standard_renderer_lines, float duration_sec = 0.0f);
@@ -135,6 +131,7 @@ namespace spartan
         // swapchain
         static RHI_SwapChain* GetSwapChain();
         static void BlitToBackBuffer(RHI_CommandList* cmd_list, RHI_Texture* texture);
+        static void BlitToXrSwapchain(RHI_CommandList* cmd_list, RHI_Texture* texture);
         static void SubmitAndPresent();
 
         // misc
@@ -142,7 +139,11 @@ namespace spartan
         static uint64_t GetFrameNumber();
         static RHI_Api_Type GetRhiApiType();
         static void Screenshot();
+        static void Screenshot(const std::string& file_path);
         static RHI_CommandList* GetCommandListPresent() { return m_cmd_list_present; }
+
+        // write a draw data entry and return its index
+        static uint32_t WriteDrawData(const math::Matrix& transform, const math::Matrix& transform_previous = math::Matrix::Identity, uint32_t material_index = 0, uint32_t is_transparent = 0);
 
         // wind
         static const math::Vector3& GetWind();
@@ -159,6 +160,11 @@ namespace spartan
         // resolution output
         static const math::Vector2& GetResolutionOutput();
         static void SetResolutionOutput(uint32_t width, uint32_t height, bool recreate_resources = true);
+        static float GetResolutionScale();
+        static uint32_t GetScaledDimension(uint32_t dimension, float scale = -1.0f);
+
+        // force render target recreation (e.g. when xr stereo mode changes)
+        static void RecreateRenderTargets();
 
         // get all
         static std::array<std::shared_ptr<RHI_Texture>, static_cast<uint32_t>(Renderer_RenderTarget::max)>& GetRenderTargets();
@@ -180,10 +186,10 @@ namespace spartan
         static std::shared_ptr<Font>& GetFont();
         static std::shared_ptr<Material>& GetStandardMaterial();
         static void ClearMaterialTextureReferences();
-        static void SwapVisibilityBuffers();
-
     private:
         static void UpdateFrameConstantBuffer(RHI_CommandList* cmd_list);
+        static bool SetResolution(math::Vector2& current, uint32_t width, uint32_t height, bool recreate_resources,
+                                  bool create_render, bool create_output, const char* label);
 
         // resources
         static void CreateBuffers();
@@ -203,24 +209,28 @@ namespace spartan
         static void ProduceFrame(RHI_CommandList* cmd_list_graphics_present, RHI_CommandList* cmd_list_compute);
         static void Pass_VariableRateShading(RHI_CommandList* cmd_list);
         static void Pass_ShadowMaps(RHI_CommandList* cmd_list);
-        static void Pass_Occlusion(RHI_CommandList* cmd_list);
+        static void Pass_HiZ(RHI_CommandList* cmd_list);
+        static void Pass_IndirectCull(RHI_CommandList* cmd_list);
         static void Pass_Depth_Prepass(RHI_CommandList* cmd_list);
         static void Pass_GBuffer(RHI_CommandList* cmd_list, const bool is_transparent_pass);
+        static void Pass_MeshletVisualize(RHI_CommandList* cmd_list);
         static void Pass_ScreenSpaceAmbientOcclusion(RHI_CommandList* cmd_list);
-        static void Pass_TransparencyReflectionRefraction(RHI_CommandList* cmd_list);
-        static void Pass_RayTracedReflections(RHI_CommandList* cmd_list);
+        static void Pass_TransparencyReflectionRefraction(RHI_CommandList* cmd_list, uint32_t eye_layer = rhi_all_mips);
+        static void Pass_RayTracedReflections(RHI_CommandList* cmd_list, uint32_t eye_layer = rhi_all_mips);
         static void Pass_RayTracedShadows(RHI_CommandList* cmd_list);
         static void Pass_ReSTIR_PathTracing(RHI_CommandList* cmd_list);
-        static void Pass_Denoiser(RHI_CommandList* cmd_list, RHI_Texture* tex_in, RHI_Texture* tex_out);
-        static void Pass_Light_Reflections(RHI_CommandList* cmd_list);
+        static void Pass_ReSTIR_Denoising(RHI_CommandList* cmd_list);
+        static void Pass_Light_Reflections(RHI_CommandList* cmd_list, uint32_t eye_layer = rhi_all_mips);
         static void Pass_ScreenSpaceShadows(RHI_CommandList* cmd_list);
         static void Pass_Skysphere(RHI_CommandList* cmd_list);
         // passes - lighting
-        static void Pass_Light(RHI_CommandList* cmd_list, const bool is_transparent_pass);
-        static void Pass_Light_Composition(RHI_CommandList* cmd_list, const bool is_transparent_pass);
-        static void Pass_Light_ImageBased(RHI_CommandList* cmd_list);
+        static void Pass_Light(RHI_CommandList* cmd_list, const bool is_transparent_pass, uint32_t eye_layer = rhi_all_mips);
+        static void Pass_Light_Composition(RHI_CommandList* cmd_list, const bool is_transparent_pass, uint32_t eye_layer = rhi_all_mips);
+        static void Pass_Light_ImageBased(RHI_CommandList* cmd_list, uint32_t eye_layer = rhi_all_mips);
         static void Pass_Lut_BrdfSpecular(RHI_CommandList* cmd_list);
         static void Pass_Lut_AtmosphericScattering(RHI_CommandList* cmd_list);
+        // passes - particles
+        static void Pass_Particles(RHI_CommandList* cmd_list);
         // passes - volumetric clouds
         static void Pass_CloudNoise(RHI_CommandList* cmd_list);
         static void Pass_CloudShadow(RHI_CommandList* cmd_list);
@@ -231,19 +241,14 @@ namespace spartan
         static void Pass_Icons(RHI_CommandList* cmd_list, RHI_Texture* tex_out);
         static void Pass_Text(RHI_CommandList* cmd_list, RHI_Texture* tex_out);
         // passes - post-process
-        static void Pass_PostProcess(RHI_CommandList* cmd_list);
+        static void Pass_PostProcess(RHI_CommandList* cmd_list, uint32_t eye_layer = rhi_all_mips);
         static void Pass_Output(RHI_CommandList* cmd_list, RHI_Texture* tex_in, RHI_Texture* tex_out);
-        static void Pass_Fxaa(RHI_CommandList* cmd_list, RHI_Texture* tex_in, RHI_Texture* tex_out);
-        static void Pass_FilmGrain(RHI_CommandList* cmd_list, RHI_Texture* tex_in, RHI_Texture* tex_out);
-        static void Pass_Vhs(RHI_CommandList* cmd_list, RHI_Texture* tex_in, RHI_Texture* tex_out);
-        static void Pass_ChromaticAberration(RHI_CommandList* cmd_list, RHI_Texture* tex_in, RHI_Texture* tex_out);
-        static void Pass_MotionBlur(RHI_CommandList* cmd_list, RHI_Texture* tex_in, RHI_Texture* tex_out);
-        static void Pass_DepthOfField(RHI_CommandList* cmd_list, RHI_Texture* tex_in, RHI_Texture* tex_out);
         static void Pass_Bloom(RHI_CommandList* cmd_list, RHI_Texture* tex_in, RHI_Texture* tex_out);
-        static void Pass_Sharpening(RHI_CommandList* cmd_list, RHI_Texture* tex_in, RHI_Texture* tex_out);
-        static void Pass_Dithering(RHI_CommandList* cmd_list, RHI_Texture* tex_in, RHI_Texture* tex_out);
-        static void Pass_AA_Upscale(RHI_CommandList* cmd_list);
+        static void Pass_AA_Upscale(RHI_CommandList* cmd_list, uint32_t eye_layer = rhi_all_mips);
         static void Pass_AutoExposure(RHI_CommandList* cmd_list, RHI_Texture* tex_in);
+        template<typename F = std::nullptr_t>
+        static void Pass_Compute(RHI_CommandList* cmd_list, const char* name, Renderer_Shader shader_enum,
+                                 RHI_Texture* tex_in, RHI_Texture* tex_out, F setup = nullptr);
         // passes - utility
         static void Pass_Blit(RHI_CommandList* cmd_list, RHI_Texture* tex_in, RHI_Texture* tex_out);
         static void Pass_Downscale(RHI_CommandList* cmd_list, RHI_Texture* tex, const Renderer_DownsampleFilter filter);
@@ -255,16 +260,17 @@ namespace spartan
         // bindless
         static void UpdateMaterials(RHI_CommandList* cmd_list);
         static void UpdateLights(RHI_CommandList* cmd_lis);
-        static void UpdatedBoundingBoxes(RHI_CommandList* cmd_list);
+        static void UpdateBoundingBoxes(RHI_CommandList* cmd_list);
 
         // misc
         static void AddLinesToBeRendered();
         static void UpdatePersistentLines();
-        static void SetCommonTextures(RHI_CommandList* cmd_list);
+        static void SetCommonTextures(RHI_CommandList* cmd_list, uint32_t eye_layer = rhi_all_mips);
         static void DestroyResources();
         static void UpdateShadowAtlas();
         static void UpdateDrawCalls(RHI_CommandList* cmd_list);
         static void UpdateAccelerationStructures(RHI_CommandList* cmd_list);
+        static void RotateFrameBuffers();
 
         // draw calls
         static std::array<Renderer_DrawCall, renderer_max_draw_calls> m_draw_calls;
@@ -272,28 +278,85 @@ namespace spartan
         static std::array<Renderer_DrawCall, renderer_max_draw_calls> m_draw_calls_prepass;
         static uint32_t m_draw_calls_prepass_count;
 
+        // gpu-driven indirect drawing
+        // m_indirect_draw_data holds per-renderable lod entries, sized for the per-renderable budget
+        // m_cull_tasks expands to one entry per (renderable, meshlet) and is what the cull pass dispatches over
+        static std::array<Sb_DrawData, renderer_max_indirect_draws> m_indirect_draw_data;
+        static uint32_t m_indirect_draw_count;
+        // count of distinct renderables in the indirect path, used to lay out one aabb slot per renderable
+        static uint32_t m_indirect_renderable_count;
+        static std::array<Sb_CullTask, renderer_max_cull_tasks> m_cull_tasks;
+        static uint32_t m_cull_task_count;
+
+        // per-frame gpu buffers, rotated so in-flight frames never race
+        struct FrameResource
+        {
+            std::shared_ptr<RHI_Buffer> indirect_draw_args;     // single-slot args buffer for the final non-indexed indirect draw
+            std::shared_ptr<RHI_Buffer> indirect_draw_data;     // per-renderable lod draw data
+            std::shared_ptr<RHI_Buffer> meshlet_instances;      // meshlet-cull survivor list
+            std::shared_ptr<RHI_Buffer> visible_triangles;      // triangle-cull survivor list (packed meshlet_instance + triangle index)
+            std::shared_ptr<RHI_Buffer> triangle_dispatch_args; // single-slot indirect dispatch args for the triangle cull pass
+            std::shared_ptr<RHI_Buffer> cull_tasks;
+        };
+        static std::array<FrameResource, renderer_draw_data_buffer_count> m_frame_resources;
+        static uint32_t m_frame_resource_index;
+
+        // cpu-side draw data staging
+        static std::array<Sb_DrawData, renderer_max_draw_calls> m_draw_data_cpu;
+        static uint32_t m_draw_data_count;
+
         // bindless
         static std::array<RHI_Texture*, rhi_max_array_size> m_bindless_textures;
         static std::array<Sb_Light, rhi_max_array_size> m_bindless_lights;
         static std::array<Sb_Aabb, rhi_max_array_size> m_bindless_aabbs;
         static bool m_bindless_samplers_dirty;
 
+        // one-shot and feature-toggle state
+        struct PassState
+        {
+            // one-shot initialization (run once, never again unless reset)
+            bool brdf_lut_produced       = false;
+            bool atmosphere_lut_produced = false;
+            bool cloud_noise_produced    = false;
+
+            // feature-toggle clear flags (set when feature disabled, reset when re-enabled)
+            bool cleared_reflections     = false;
+            bool cleared_rt_reflections  = false;
+            bool cleared_rt_shadows      = false;
+            bool cleared_restir          = false;
+
+            // skysphere convergence tracking
+            bool     sky_first_frame           = true;
+            bool     sky_had_directional_light = false;
+            float    sky_last_coverage         = -1.0f;
+            uint32_t sky_frames_remaining      = 0;
+
+            // vrs
+            RHI_Texture* vrs_last_cleared_texture = nullptr;
+
+            void Reset()
+            {
+                *this = PassState();
+            }
+        };
+        static PassState m_pass_state;
+
         // misc
         static Cb_Frame m_cb_frame_cpu;
         static Pcb_Pass m_pcb_pass_cpu;
+        static math::Matrix m_view_projection_previous_right;
+        static math::Matrix m_view_projection_previous_unjittered_left;
         static std::shared_ptr<RHI_Buffer> m_lines_vertex_buffer;
         static std::vector<RHI_Vertex_PosCol> m_lines_vertices;
         static std::vector<PersistentLine> m_persistent_lines;
         static std::vector<std::tuple<RHI_Texture*, math::Vector3>> m_icons;
         static uint32_t m_resource_index;
         static std::atomic<bool> m_initialized_resources;
-        static std::mutex m_mutex_renderables;
         static bool m_transparents_present;
+        static bool m_is_hiz_suppressed;
         static RHI_CommandList* m_cmd_list_present;
+        static RHI_CommandList* m_cmd_list_compute;
         static std::vector<ShadowSlice> m_shadow_slices;
-        static std::unique_ptr<RHI_Buffer> m_std_reflections; // it temporarily lives here
-        static std::unique_ptr<RHI_Buffer> m_std_shadows;     // shader binding table for ray traced shadows
-        static std::unique_ptr<RHI_Buffer> m_std_restir;      // shader binding table for restir path tracing
         static uint32_t m_count_active_lights;
     };
 }

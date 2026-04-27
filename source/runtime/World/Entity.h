@@ -39,7 +39,7 @@ namespace pugi
 
 namespace spartan
 {
-    class Renderable;
+    class Render;
 
     class Entity : public SpartanObject
     {
@@ -48,6 +48,8 @@ namespace spartan
         ~Entity();
 
         Entity* Clone();
+
+        static void RegisterForScripting(sol::state_view State);
 
         // core
         void Start();
@@ -62,6 +64,10 @@ namespace spartan
         // active
         bool GetActive();
         void SetActive(const bool active);
+
+        Component* GetComponentByType(ComponentType Type) const;
+        Component* AddComponentByType(ComponentType Type);
+        void RemoveComponentByType(ComponentType Type);
 
         // adds a component of type T
         template <class T>
@@ -86,7 +92,7 @@ namespace spartan
             return component.get();
         }
 
-        // adds a component of ComponentType 
+        // adds a component of ComponentType
         Component* AddComponent(ComponentType type);
 
         // returns a component of type T
@@ -103,9 +109,9 @@ namespace spartan
         {
             const ComponentType component_type = Component::TypeToEnum<T>();
             m_components[static_cast<uint32_t>(component_type)] = nullptr;
-
-            World::Resolve();
         }
+
+        bool IsActive() const { return m_is_active; }
 
         void RemoveComponentById(uint64_t id);
         const auto& GetAllComponents() const { return m_components; }
@@ -153,6 +159,7 @@ namespace spartan
         void AcquireChildren();
         void RemoveChild(Entity* child, bool update_child_with_null_parent = true);
         void AddChild(Entity* child);
+        void MoveChildToIndex(Entity* child, uint32_t index);
         bool IsDescendantOf(Entity* transform) const;
         void GetDescendants(std::vector<Entity*>* descendants);
         Entity* GetDescendantByName(const std::string& name);
@@ -171,7 +178,14 @@ namespace spartan
 
         // prefab support - if set, this entity saves as a prefab reference instead of its children
         void SetPrefabData(const std::string& type, const std::unordered_map<std::string, std::string>& attributes);
-        bool HasPrefabData() const { return !m_prefab_type.empty(); }
+        bool HasPrefabData() const                                                             { return !m_prefab_type.empty() || !m_prefab_file_path.empty(); }
+        const std::string& GetPrefabType() const                                               { return m_prefab_type; }
+        const std::string& GetPrefabFilePath() const                                           { return m_prefab_file_path; }
+        const std::unordered_map<std::string, std::string>& GetPrefabAttributes() const        { return m_prefab_attributes; }
+        bool IsCodePrefab() const                                                              { return !m_prefab_type.empty(); }
+        bool IsFilePrefab() const                                                              { return !m_prefab_file_path.empty(); }
+        void SetPrefabFilePath(const std::string& path);
+        void ClearPrefabData();
 
         // transient entities are not serialized (e.g. dynamically created entities like flashlights)
         void SetTransient(bool transient)  { m_transient = transient; }
@@ -212,6 +226,7 @@ namespace spartan
 
         // prefab data (if this entity was created from a prefab)
         std::string m_prefab_type;
+        std::string m_prefab_file_path;
         std::unordered_map<std::string, std::string> m_prefab_attributes;
     };
 }

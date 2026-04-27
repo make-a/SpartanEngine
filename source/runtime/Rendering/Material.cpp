@@ -81,6 +81,7 @@ namespace spartan
                 case MaterialProperty::TextureOffsetY:             return "texture_offset_y";
                 case MaterialProperty::TextureInvertX:             return "texture_invert_x";
                 case MaterialProperty::TextureInvertY:             return "texture_invert_y";
+                case MaterialProperty::TextureRotation:            return "texture_rotation";
         
                 // Special effects
                 case MaterialProperty::IsTerrain:                  return "texture_slope_based";
@@ -354,7 +355,6 @@ namespace spartan
                 shared_ptr<RHI_Texture> texture_normal_new = ResourceCache::GetByName<RHI_Texture>(normal_name);
                 if (!texture_normal_new)
                 {
-                    // create new normal texture - don't compress to keep raw bytes for repacking
                     texture_normal_new = make_shared<RHI_Texture>(
                         RHI_Texture_Type::Type2D,
                         width,
@@ -362,9 +362,10 @@ namespace spartan
                         depth,
                         mip_count,
                         RHI_Format::R8G8B8A8_Unorm,
-                        RHI_Texture_Srv,
+                        RHI_Texture_Srv | RHI_Texture_Compress,
                         normal_name.c_str()
                     );
+                    texture_normal_new->SetCompressionFormat(RHI_Format::BC5_Unorm);
         
                     // allocate mip
                     texture_normal_new->AllocateMip();
@@ -502,6 +503,7 @@ namespace spartan
                             tex_name.c_str()
                         );
                         texture_packed->SetResourceName(packed_name);
+                        texture_packed->SetCompressionFormat(RHI_Format::BC3_Unorm);
                         
                         // set resource file path so the texture can be cached and properly referenced by materials
                         // the path matches what World::SaveToFile uses when saving textures
@@ -562,6 +564,20 @@ namespace spartan
                     material->SetTexture(MaterialTextureType::Packed, texture_packed, slot);
                 }
             }
+
+            // mark non-packed material textures for compression with appropriate formats;
+            // this runs after packing so the raw data has already been read for channel packing
+            if (texture_color && !texture_color->IsCompressedFormat())
+            {
+                texture_color->SetFlag(RHI_Texture_Compress);
+                texture_color->SetCompressionFormat(texture_color->IsSemiTransparent() ? RHI_Format::BC3_Unorm : RHI_Format::BC1_Unorm);
+            }
+
+            if (texture_normal && !texture_normal->IsCompressedFormat())
+            {
+                texture_normal->SetFlag(RHI_Texture_Compress);
+                texture_normal->SetCompressionFormat(RHI_Format::BC5_Unorm);
+            }
         }
     }
 
@@ -607,10 +623,13 @@ namespace spartan
             m_properties[i] = node_material.child(attribute_name).text().as_float();
         }
     
-        // load textures
+        // load textures (skip packed textures as they're regenerated from source textures during PrepareForGpu)
         pugi::xml_node textures_node = node_material.child("textures");
         for (uint32_t type = 0; type < static_cast<uint32_t>(MaterialTextureType::Max); ++type)
         {
+            if (static_cast<MaterialTextureType>(type) == MaterialTextureType::Packed)
+                continue;
+
             for (uint32_t slot = 0; slot < slots_per_texture; ++slot)
             {
                 uint32_t index   = type * slots_per_texture + slot;
@@ -621,14 +640,18 @@ namespace spartan
     
                 string tex_name = node_texture.attribute("texture_name").as_string();
                 string tex_path = node_texture.attribute("texture_path").as_string();
-    
-                // if the texture is already loaded, get a reference to it
-                auto texture = ResourceCache::GetByName<RHI_Texture>(tex_name);
 
-                // if the texture is not loaded yet, load it
-                if (!texture && !tex_path.empty())
+                // load by path first since paths are unique
+                // name-based lookup is a fallback because names like "normal" collide across materials
+                shared_ptr<RHI_Texture> texture;
+                if (!tex_path.empty())
                 {
                     texture = ResourceCache::Load<RHI_Texture>(tex_path);
+                }
+
+                if (!texture && !tex_name.empty())
+                {
+                    texture = ResourceCache::GetByName<RHI_Texture>(tex_name);
                 }
     
                 if (texture)
@@ -643,6 +666,14 @@ namespace spartan
     
     void Material::SaveToFile(const string& file_path)
     {
+        // skip when called without a resolved path (e.g. mid-import via SetTexture's auto-save)
+        // and serialize concurrent saves of the same material so parallel SetTexture calls cannot race on the file
+        if (file_path.empty())
+            return;
+
+        static mutex save_mutex;
+        lock_guard<mutex> lock(save_mutex);
+
         SetResourceFilePath(file_path);
         pugi::xml_document doc;
         pugi::xml_node material_node = doc.append_child("Material");
@@ -654,11 +685,14 @@ namespace spartan
             material_node.append_child(attribute_name).text().set(m_properties[i]);
         }
     
-        // save textures
+        // save textures (skip packed textures as they're regenerated from source textures during PrepareForGpu)
         pugi::xml_node textures_node = material_node.append_child("textures");
         textures_node.append_attribute("count").set_value(static_cast<uint32_t>(m_textures.size()));
         for (uint32_t type = 0; type < static_cast<uint32_t>(MaterialTextureType::Max); ++type)
         {
+            if (static_cast<MaterialTextureType>(type) == MaterialTextureType::Packed)
+                continue;
+
             for (uint32_t slot = 0; slot < slots_per_texture; ++slot)
             {
                 uint32_t index   = type * slots_per_texture + slot;
@@ -719,8 +753,11 @@ namespace spartan
             }
         }
 
-        // save on change
-        SaveToFile(GetResourceFilePath());
+        // save on change, but not during loading (auto_adjust_multipler is false when called from LoadFromFile)
+        if (auto_adjust_multipler)
+        {
+            SaveToFile(GetResourceFilePath());
+        }
     }
 
     void Material::SetTexture(const MaterialTextureType texture_type, shared_ptr<RHI_Texture> texture, const uint8_t slot)

@@ -24,6 +24,7 @@ CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 //= INCLUDES ===================
 #include "../Math/BoundingBox.h"
 #include <string>
+#include <sol/sol.hpp>
 //==============================
 
 namespace spartan
@@ -52,13 +53,18 @@ namespace spartan
         static bool LoadFromFile(const std::string& file_path);
 
         // entities
+        static sol::state_view GetLuaState();
         static Entity* CreateEntity();
         static bool EntityExists(Entity* entity);
         static void RemoveEntity(Entity* entity);
+        static void RemoveEntityImmediate(Entity* entity);
         static void GetRootEntities(std::vector<Entity*>& entities);
+        static void MoveEntityToIndex(Entity* entity, uint32_t index);
+        static void MoveRootEntityNear(Entity* entity_to_move, Entity* target_entity, bool insert_after);
         static Entity* GetEntityById(uint64_t id);
         static const std::vector<Entity*>& GetEntities();
         static const std::vector<Entity*>& GetEntitiesLights();
+        static const std::vector<Entity*>& GetEntitiesRenderables();
 
         // misc
         static const std::string& GetName();
@@ -69,11 +75,15 @@ namespace spartan
         static uint32_t GetLightCount();
         static uint32_t GetAudioSourceCount();
         static bool HaveMaterialsChangedThisFrame();
-        static bool HaveLightsChangedThisFrame();
+        static bool HaveLightsChanged();
 
         // world time: 0.0 = midnight, 0.5 = noon, 1.0 = next midnight
         static float GetTimeOfDay(bool use_real_world_time = false);
         static void SetTimeOfDay(float time_of_day);
+
+        // wind
+        static const math::Vector3& GetWind();
+        static void SetWind(const math::Vector3& wind);
 
         // world metadata
         static const std::string& GetDescription();

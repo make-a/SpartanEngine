@@ -22,25 +22,57 @@ CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 #ifndef SPARTAN_RESTIR_RESERVOIR
 #define SPARTAN_RESTIR_RESERVOIR
 
-static const uint RESTIR_MAX_PATH_LENGTH     = 3;
-static const uint RESTIR_M_CAP               = 32;
-static const uint RESTIR_SPATIAL_SAMPLES     = 8;
-static const float RESTIR_SPATIAL_RADIUS     = 16.0f;
+// core parameters
+static const uint  RESTIR_MAX_PATH_LENGTH    = 5;
+static const uint  RESTIR_M_CAP              = 256;
+static const uint  RESTIR_SPATIAL_SAMPLES    = 8;
 static const float RESTIR_DEPTH_THRESHOLD    = 0.05f;
-static const float RESTIR_NORMAL_THRESHOLD   = 0.9f;
-static const float RESTIR_TEMPORAL_DECAY     = 0.9f;
-static const float RESTIR_RAY_NORMAL_OFFSET  = 0.01f;
+static const float RESTIR_NORMAL_THRESHOLD   = 0.75f;
+static const float RESTIR_TEMPORAL_DECAY     = 0.97f;
 static const float RESTIR_RAY_T_MIN          = 0.001f;
 
+// sky / environment
+static const float RESTIR_SKY_RADIANCE_CLAMP = 50.0f;
+static const float RESTIR_SKY_W_CLAMP        = 30.0f;
+static const float RESTIR_SKY_DISTANCE       = 1e10f;
+
+// reconnection criteria (lin 2022 hybrid shift, reconnection leg)
+static const float RESTIR_RC_MIN_DISTANCE    = 0.1f;
+static const float RESTIR_RC_MIN_ROUGHNESS   = 0.2f;
+static const float RESTIR_RC_COS_FRONT       = 0.05f;
+static const float RESTIR_JACOBIAN_CLAMP     = 50.0f;
+
+// brdf / numerics
+static const float RESTIR_MIN_PDF            = 1e-6f;
+static const float RESTIR_W_CLAMP_DEFAULT    = 50.0f;
+
+// firefly suppression (applied once at storage time to rc_radiance)
+static const float RESTIR_FIREFLY_LUMA       = 150.0f;
+
+// path flags
+static const uint PATH_FLAG_SKY      = 1 << 0;  // rc is the sky dome, rc_pos stores a unit direction
+static const uint PATH_FLAG_HAS_RC   = 1 << 1;  // reconnection vertex is valid for reconnection shift
+static const uint PATH_FLAG_SPECULAR = 1 << 2;  // diagnostic: primary surface is specular-leaning
+
+// a path sample stores the suffix of a path beginning at the current pixel's primary hit
+// the primary vertex is NOT stored; it is re-derived from the g-buffer each pass
+// rc_pos is a world-space reconnection vertex (PATH_FLAG_HAS_RC) or a unit sky direction (PATH_FLAG_SKY)
+// rc_radiance is the outgoing radiance leaving rc toward the source primary
+// rc_prev_pos is the position of the vertex immediately before rc in the source path
+// (equal to src_primary_pos when rc_length == 2, or the specular bounce position when rc_length == 3)
+// rc_outgoing_dir is the direction leaving rc to the next bounce; reserved for future brdf-at-rc
+// correction but currently unused by the shift (which relies on the rc roughness gate for bias)
 struct PathSample
 {
-    float3 hit_position;
-    float3 hit_normal;
-    float3 direction;
-    float3 radiance;
+    float3 rc_pos;
+    float3 rc_normal;
+    float3 rc_radiance;
+    float3 rc_prev_pos;
+    float3 rc_outgoing_dir;
+    uint   seed_path;
     uint   path_length;
+    uint   rc_length;
     uint   flags;
-    float  pdf;
 };
 
 struct Reservoir
@@ -50,12 +82,9 @@ struct Reservoir
     float      M;
     float      W;
     float      target_pdf;
+    float      age;
+    float      confidence;
 };
-
-static const uint PATH_FLAG_SPECULAR = 1 << 0;
-static const uint PATH_FLAG_DIFFUSE  = 1 << 1;
-static const uint PATH_FLAG_CAUSTIC  = 1 << 2;
-static const uint PATH_FLAG_DELTA    = 1 << 3;
 
 float2 octahedral_encode(float3 n)
 {
@@ -79,133 +108,133 @@ float3 octahedral_decode(float2 e)
     return normalize(n);
 }
 
-uint pack_path_info(uint path_length, uint flags)
+uint pack_path_info(uint path_length, uint rc_length, uint flags)
 {
-    return (path_length & 0xFFFF) | ((flags & 0xFFFF) << 16);
+    return (path_length & 0xFFu) | ((rc_length & 0xFFu) << 8u) | ((flags & 0xFFFFu) << 16u);
 }
 
-void unpack_path_info(uint packed, out uint path_length, out uint flags)
+void unpack_path_info(uint packed, out uint path_length, out uint rc_length, out uint flags)
 {
-    path_length = packed & 0xFFFF;
-    flags = (packed >> 16) & 0xFFFF;
+    path_length = packed & 0xFFu;
+    rc_length   = (packed >> 8u) & 0xFFu;
+    flags       = (packed >> 16u) & 0xFFFFu;
 }
 
+// reservoir texture packing (5 x RGBA32F = 20 floats)
+// tex0.xyz = rc_pos
+// tex0.w   = rc_normal.oct.x
+// tex1.x   = rc_normal.oct.y
+// tex1.yzw = rc_radiance
+// tex2.x   = asfloat(seed_path)
+// tex2.y   = asfloat(packed: path_length | rc_length | flags)
+// tex2.z   = weight_sum
+// tex2.w   = M
+// tex3.x   = W
+// tex3.y   = target_pdf
+// tex3.zw  = rc_outgoing_dir.oct (xy)
+// tex4.xyz = rc_prev_pos
+// tex4.w   = asfloat(pack_f16x2(age, confidence))
 void pack_reservoir(Reservoir r, out float4 tex0, out float4 tex1, out float4 tex2, out float4 tex3, out float4 tex4)
 {
-    float2 normal_oct    = octahedral_encode(r.sample.hit_normal);
-    float2 direction_oct = octahedral_encode(r.sample.direction);
+    float2 normal_oct  = octahedral_encode(r.sample.rc_normal);
+    float2 outgoing_oct = octahedral_encode(r.sample.rc_outgoing_dir);
+    uint   age_conf_packed = f32tof16(r.age) | (f32tof16(r.confidence) << 16u);
 
-    tex0 = float4(r.sample.hit_position, normal_oct.x);
-    tex1 = float4(normal_oct.y, direction_oct.xy, r.sample.radiance.x);
-    tex2 = float4(r.sample.radiance.yz, r.sample.pdf, r.weight_sum);
-    tex3 = float4(r.M, r.W, r.target_pdf, asfloat(pack_path_info(r.sample.path_length, r.sample.flags)));
-    tex4 = float4(0, 0, 0, 0);
+    tex0 = float4(r.sample.rc_pos, normal_oct.x);
+    tex1 = float4(normal_oct.y, r.sample.rc_radiance);
+    tex2 = float4(
+        asfloat(r.sample.seed_path),
+        asfloat(pack_path_info(r.sample.path_length, r.sample.rc_length, r.sample.flags)),
+        r.weight_sum,
+        r.M
+    );
+    tex3 = float4(r.W, r.target_pdf, outgoing_oct.x, outgoing_oct.y);
+    tex4 = float4(r.sample.rc_prev_pos, asfloat(age_conf_packed));
 }
 
 Reservoir unpack_reservoir(float4 tex0, float4 tex1, float4 tex2, float4 tex3, float4 tex4)
 {
     Reservoir r;
-    r.sample.hit_position = tex0.xyz;
-    r.sample.hit_normal   = octahedral_decode(float2(tex0.w, tex1.x));
-    r.sample.direction    = octahedral_decode(tex1.yz);
-    r.sample.radiance     = float3(tex1.w, tex2.xy);
-    r.sample.pdf          = tex2.z;
-    r.weight_sum          = tex2.w;
-    r.M                   = tex3.x;
-    r.W                   = tex3.y;
-    r.target_pdf          = tex3.z;
+    r.sample.rc_pos          = tex0.xyz;
+    r.sample.rc_normal       = octahedral_decode(float2(tex0.w, tex1.x));
+    r.sample.rc_radiance     = tex1.yzw;
+    r.sample.rc_outgoing_dir = octahedral_decode(tex3.zw);
+    r.sample.rc_prev_pos     = tex4.xyz;
+    r.sample.seed_path       = asuint(tex2.x);
 
-    uint packed_info = asuint(tex3.w);
-    unpack_path_info(packed_info, r.sample.path_length, r.sample.flags);
+    uint packed_info = asuint(tex2.y);
+    unpack_path_info(packed_info, r.sample.path_length, r.sample.rc_length, r.sample.flags);
+
+    r.weight_sum = tex2.z;
+    r.M          = tex2.w;
+    r.W          = tex3.x;
+    r.target_pdf = tex3.y;
+
+    uint age_conf = asuint(tex4.w);
+    r.age        = f16tof32(age_conf & 0xFFFFu);
+    r.confidence = f16tof32(age_conf >> 16u);
 
     return r;
 }
 
+bool is_sky_sample(PathSample s)     { return (s.flags & PATH_FLAG_SKY)    != 0; }
+bool has_reconnection(PathSample s)  { return (s.flags & PATH_FLAG_HAS_RC) != 0; }
+
 bool is_reservoir_valid(Reservoir r)
 {
-    if (any(isnan(r.sample.hit_position)) || any(isinf(r.sample.hit_position)))
-        return false;
-    if (any(isnan(r.sample.radiance)) || any(isinf(r.sample.radiance)))
-        return false;
-    if (any(isnan(r.sample.hit_normal)) || any(isinf(r.sample.hit_normal)))
-        return false;
-    if (isnan(r.W) || isinf(r.W) || r.W < 0)
-        return false;
-    if (isnan(r.M) || r.M < 0)
-        return false;
-
-    float normal_len = length(r.sample.hit_normal);
-    if (normal_len < 0.5f || normal_len > 1.5f)
-        return false;
-
+    if (any(isnan(r.sample.rc_pos))      || any(isinf(r.sample.rc_pos)))      return false;
+    if (any(isnan(r.sample.rc_radiance)) || any(isinf(r.sample.rc_radiance))) return false;
+    if (any(isnan(r.sample.rc_normal))   || any(isinf(r.sample.rc_normal)))   return false;
+    if (isnan(r.W) || isinf(r.W) || r.W < 0)                                  return false;
+    if (isnan(r.M) || r.M < 0)                                                return false;
+    if (r.sample.rc_length > RESTIR_MAX_PATH_LENGTH)                          return false;
     return true;
 }
 
 Reservoir create_empty_reservoir()
 {
     Reservoir r;
-    r.sample.hit_position = float3(0, 0, 0);
-    r.sample.hit_normal   = float3(0, 1, 0);
-    r.sample.direction    = float3(0, 0, 1);
-    r.sample.radiance     = float3(0, 0, 0);
-    r.sample.path_length  = 0;
-    r.sample.flags        = 0;
-    r.sample.pdf          = 0;
-    r.weight_sum          = 0;
-    r.M                   = 0;
-    r.W                   = 0;
-    r.target_pdf          = 0;
+    r.sample.rc_pos          = float3(0, 0, 0);
+    r.sample.rc_normal       = float3(0, 1, 0);
+    r.sample.rc_radiance     = float3(0, 0, 0);
+    r.sample.rc_prev_pos     = float3(0, 0, 0);
+    r.sample.rc_outgoing_dir = float3(0, 1, 0);
+    r.sample.seed_path       = 0;
+    r.sample.path_length     = 0;
+    r.sample.rc_length       = 0;
+    r.sample.flags           = 0;
+    r.weight_sum             = 0;
+    r.M                      = 0;
+    r.W                      = 0;
+    r.target_pdf             = 0;
+    r.age                    = 0;
+    r.confidence             = 0;
     return r;
 }
 
-float calculate_target_pdf(float3 radiance)
+float get_w_clamp_for_sample(PathSample s)
 {
-    float lum = dot(radiance, float3(0.299, 0.587, 0.114));
-    lum = clamp(lum, 0.0f, 65504.0f);
-    float compressed = log(1.0f + lum) / (1.0f + log(1.0f + lum) * 0.5f);
-    return max(compressed, 1e-6f);
+    return is_sky_sample(s) ? RESTIR_SKY_W_CLAMP : RESTIR_W_CLAMP_DEFAULT;
 }
 
 bool update_reservoir(inout Reservoir reservoir, PathSample new_sample, float weight, float random_value)
 {
+    if (weight <= 0.0f || isnan(weight) || isinf(weight))
+    {
+        reservoir.M += 1.0f;
+        return false;
+    }
+
     reservoir.weight_sum += weight;
-    reservoir.M += 1.0f;
+    reservoir.M          += 1.0f;
 
     if (random_value * reservoir.weight_sum < weight)
     {
         reservoir.sample = new_sample;
+        reservoir.age    = 0.0f;
         return true;
     }
     return false;
-}
-
-bool merge_reservoir(inout Reservoir dst, Reservoir src, float target_pdf_at_dst, float random_value)
-{
-    float weight = target_pdf_at_dst * src.W * src.M;
-
-    dst.weight_sum += weight;
-    dst.M += src.M;
-
-    if (random_value * dst.weight_sum < weight)
-    {
-        dst.sample     = src.sample;
-        dst.target_pdf = target_pdf_at_dst;
-        return true;
-    }
-    return false;
-}
-
-void finalize_reservoir(inout Reservoir reservoir)
-{
-    float target_pdf = calculate_target_pdf(reservoir.sample.radiance);
-    reservoir.target_pdf = target_pdf;
-
-    if (target_pdf > 0 && reservoir.M > 0)
-        reservoir.W = reservoir.weight_sum / (target_pdf * reservoir.M);
-    else
-        reservoir.W = 0;
-
-    reservoir.W = min(reservoir.W, 5.0f);
 }
 
 void clamp_reservoir_M(inout Reservoir reservoir, float max_M)
@@ -221,11 +250,24 @@ void clamp_reservoir_M(inout Reservoir reservoir, float max_M)
     }
 }
 
+// rng
 uint pcg_hash(uint seed)
 {
     uint state = seed * 747796405u + 2891336453u;
     uint word  = ((state >> ((state >> 28u) + 4u)) ^ state) * 277803737u;
     return (word >> 22u) ^ word;
+}
+
+uint xxhash32(uint seed)
+{
+    const uint PRIME1 = 2654435761u;
+    const uint PRIME2 = 2246822519u;
+    const uint PRIME3 = 3266489917u;
+
+    uint h = seed + PRIME3;
+    h = (h ^ (h >> 15)) * PRIME2;
+    h = (h ^ (h >> 13)) * PRIME3;
+    return h ^ (h >> 16);
 }
 
 float random_float(inout uint seed)
@@ -234,34 +276,30 @@ float random_float(inout uint seed)
     return float(seed) / 4294967295.0f;
 }
 
-float2 random_float2(inout uint seed)
-{
-    return float2(random_float(seed), random_float(seed));
-}
-
-float3 random_float3(inout uint seed)
-{
-    return float3(random_float(seed), random_float(seed), random_float(seed));
-}
-
-uint create_seed(uint2 pixel, uint frame)
-{
-    return pcg_hash(pixel.x ^ pcg_hash(pixel.y ^ pcg_hash(frame)));
-}
+float2 random_float2(inout uint seed) { return float2(random_float(seed), random_float(seed)); }
+float3 random_float3(inout uint seed) { return float3(random_float(seed), random_float(seed), random_float(seed)); }
 
 uint create_seed_for_pass(uint2 pixel, uint frame, uint pass_id)
 {
-    uint pass_salt = pcg_hash(pass_id * 0x9E3779B9u);
-    return pcg_hash(pixel.x ^ pcg_hash(pixel.y ^ pcg_hash(frame ^ pass_salt)));
+    const uint GOLDEN_RATIO = 0x9E3779B9u;
+    const uint PASS_PRIMES[4] = { 0x85EBCA77u, 0xC2B2AE3Du, 0x27D4EB2Fu, 0x165667B1u };
+
+    uint pass_salt = (pass_id < 4) ? PASS_PRIMES[pass_id] : xxhash32(pass_id * GOLDEN_RATIO);
+
+    uint h = xxhash32(pixel.x ^ pass_salt);
+    h = pcg_hash(h ^ xxhash32(pixel.y));
+    h = pcg_hash(h ^ xxhash32(frame ^ (pass_salt >> 16)));
+    return h;
 }
 
+// sampling helpers
 float3 sample_cosine_hemisphere(float2 xi, out float pdf)
 {
-    float phi       = 2.0f * 3.14159265f * xi.x;
+    float phi       = 2.0f * PI * xi.x;
     float cos_theta = sqrt(xi.y);
     float sin_theta = sqrt(1.0f - xi.y);
 
-    pdf = cos_theta / 3.14159265f;
+    pdf = cos_theta / PI;
     return float3(cos(phi) * sin_theta, sin(phi) * sin_theta, cos_theta);
 }
 
@@ -270,14 +308,14 @@ float3 sample_ggx(float2 xi, float roughness, out float pdf)
     float a  = roughness * roughness;
     float a2 = a * a;
 
-    float phi       = 2.0f * 3.14159265f * xi.x;
+    float phi       = 2.0f * PI * xi.x;
     float cos_theta = sqrt((1.0f - xi.y) / (1.0f + (a2 - 1.0f) * xi.y));
     float sin_theta = sqrt(1.0f - cos_theta * cos_theta);
 
     float3 h = float3(cos(phi) * sin_theta, sin(phi) * sin_theta, cos_theta);
 
     float d = (a2 - 1.0f) * cos_theta * cos_theta + 1.0f;
-    pdf = a2 * cos_theta / (3.14159265f * d * d);
+    pdf = a2 * cos_theta / (PI * d * d);
 
     return h;
 }
@@ -305,50 +343,404 @@ float3 local_to_world(float3 local_dir, float3 n)
     return normalize(t * local_dir.x + b * local_dir.y + n * local_dir.z);
 }
 
-bool surface_similarity_check(float3 pos1, float3 normal1, float depth1, float3 pos2, float3 normal2, float depth2)
-{
-    if (dot(normal1, normal2) < RESTIR_NORMAL_THRESHOLD)
-        return false;
-
-    float depth_ratio = depth1 / max(depth2, 1e-6f);
-    if (abs(depth_ratio - 1.0f) > RESTIR_DEPTH_THRESHOLD)
-        return false;
-
-    return true;
-}
-
-float compute_jacobian(float3 sample_pos, float3 original_shading_pos, float3 new_shading_pos, float3 sample_normal)
-{
-    float3 dir_original = sample_pos - original_shading_pos;
-    float3 dir_new      = sample_pos - new_shading_pos;
-
-    float dist_original_sq = dot(dir_original, dir_original);
-    float dist_new_sq      = dot(dir_new, dir_new);
-
-    if (dist_original_sq < 1e-6f || dist_new_sq < 1e-6f)
-        return 0.0f;
-
-    float dist_original = sqrt(dist_original_sq);
-    float dist_new      = sqrt(dist_new_sq);
-
-    dir_original /= dist_original;
-    dir_new      /= dist_new;
-
-    float cos_original = dot(sample_normal, -dir_original);
-    float cos_new      = dot(sample_normal, -dir_new);
-
-    if (cos_original < 0.05f || cos_new < 0.05f)
-        return 0.0f;
-
-    float jacobian = (cos_new * dist_original_sq) / (cos_original * dist_new_sq + 1e-6f);
-    return clamp(jacobian, 0.0f, 10.0f);
-}
-
 float power_heuristic(float pdf_a, float pdf_b)
 {
     float a2 = pdf_a * pdf_a;
     float b2 = pdf_b * pdf_b;
     return a2 / max(a2 + b2, 1e-6f);
+}
+
+float3 clamp_sky_radiance(float3 radiance)
+{
+    float lum = dot(radiance, float3(0.299f, 0.587f, 0.114f));
+    if (lum > RESTIR_SKY_RADIANCE_CLAMP)
+        radiance *= RESTIR_SKY_RADIANCE_CLAMP / lum;
+    return radiance;
+}
+
+float compute_ray_offset(float3 pos_ws)
+{
+    float3 to_cam = pos_ws - get_camera_position();
+    float  dist   = sqrt(dot(to_cam, to_cam));
+    return clamp(dist * 1e-4f, 2e-4f, 1e-2f);
+}
+
+float3 soft_saturate_radiance(float3 radiance, float threshold)
+{
+    float lum = dot(radiance, float3(0.299f, 0.587f, 0.114f));
+    if (lum > threshold)
+    {
+        float scale = threshold + (lum - threshold) / (1.0f + (lum - threshold) / threshold);
+        radiance *= scale / lum;
+    }
+    return radiance;
+}
+
+// diffuse-vs-specular selection probability used by the importance-sampled brdf
+float compute_spec_probability(float roughness, float metallic, float n_dot_v)
+{
+    float fresnel_factor   = pow(1.0f - n_dot_v, 5.0f);
+    float base_spec        = lerp(0.04f, 1.0f, metallic);
+    float spec_response    = lerp(base_spec, 1.0f, fresnel_factor);
+    float roughness_factor = 1.0f - roughness * roughness;
+    float spec_prob        = lerp(0.1f, 0.9f, spec_response * roughness_factor + metallic * 0.5f);
+    return clamp(spec_prob, 0.1f, 0.9f);
+}
+
+// full ggx+lambert brdf evaluator returning f_r * cos(n,l) and the matching mixture pdf
+float3 evaluate_brdf(float3 albedo, float roughness, float metallic, float3 n, float3 v, float3 l, out float pdf)
+{
+    float3 h_unnorm = v + l;
+    float h_len_sq  = dot(h_unnorm, h_unnorm);
+
+    if (h_len_sq < 1e-6f)
+    {
+        pdf = 0.0f;
+        return float3(0, 0, 0);
+    }
+
+    float3 h      = h_unnorm * rsqrt(h_len_sq);
+    float n_dot_l = max(dot(n, l), 0.0f);
+    float n_dot_v = max(dot(n, v), 0.001f);
+    float n_dot_h = max(dot(n, h), 0.0f);
+    float v_dot_h = max(dot(v, h), 0.0f);
+
+    if (n_dot_l <= 0.0f)
+    {
+        pdf = 0.0f;
+        return float3(0, 0, 0);
+    }
+
+    float3 diffuse = albedo * (1.0f / PI);
+
+    float alpha   = max(roughness * roughness, 0.001f);
+    float alpha2  = alpha * alpha;
+    float d_denom = n_dot_h * n_dot_h * (alpha2 - 1.0f) + 1.0f;
+    float d       = alpha2 / (PI * d_denom * d_denom + 1e-6f);
+
+    float r_plus_1 = roughness + 1.0f;
+    float k   = (r_plus_1 * r_plus_1) / 8.0f;
+    float g_v = n_dot_v / (n_dot_v * (1.0f - k) + k + 1e-6f);
+    float g_l = n_dot_l / (n_dot_l * (1.0f - k) + k + 1e-6f);
+    float g   = g_v * g_l;
+
+    float3 f0 = lerp(float3(0.04f, 0.04f, 0.04f), albedo, metallic);
+    float3 f  = f0 + (1.0f - f0) * pow(1.0f - v_dot_h, 5.0f);
+
+    float3 specular = (d * g * f) / (4.0f * n_dot_v * n_dot_l + 1e-6f);
+    float3 f_avg       = f0 + (1.0f - f0) / 21.0f;
+    float  energy_bias = lerp(0.0f, 0.5f, roughness);
+    float3 energy_comp = 1.0f + f_avg * energy_bias;
+    specular *= energy_comp;
+
+    float3 kd   = (1.0f - f) * (1.0f - metallic);
+    float3 brdf = kd * diffuse + specular;
+
+    float diffuse_pdf = n_dot_l / PI;
+    float spec_pdf    = d * n_dot_h / (4.0f * v_dot_h + 1e-6f);
+    float spec_prob   = compute_spec_probability(roughness, metallic, n_dot_v);
+    pdf = (1.0f - spec_prob) * diffuse_pdf + spec_prob * spec_pdf;
+
+    return brdf * n_dot_l;
+}
+
+// samples a direction proportional to diffuse+specular mixture, returns the sampled direction
+// and the mixture pdf so the caller can compute brdf*cos / pdf
+float3 sample_brdf(float3 albedo, float roughness, float metallic, float3 n, float3 v, float2 xi, out float pdf)
+{
+    float n_dot_v      = max(dot(n, v), 0.001f);
+    float spec_prob    = compute_spec_probability(roughness, metallic, n_dot_v);
+    float prob_diffuse = 1.0f - spec_prob;
+
+    float3 l;
+    if (xi.x < prob_diffuse)
+    {
+        xi.x = xi.x / prob_diffuse;
+        float pdf_diffuse;
+        float3 local_dir = sample_cosine_hemisphere(xi, pdf_diffuse);
+        l = local_to_world(local_dir, n);
+    }
+    else
+    {
+        xi.x = (xi.x - prob_diffuse) / (1.0f - prob_diffuse);
+        float pdf_h;
+        float3 h       = sample_ggx(xi, max(roughness, 0.04f), pdf_h);
+        float3 h_world = local_to_world(h, n);
+        l = reflect(-v, h_world);
+    }
+
+    float n_dot_l     = max(dot(n, l), 0.001f);
+    float diffuse_pdf = n_dot_l / PI;
+
+    float3 h_unnorm = v + l;
+    float h_len_sq  = dot(h_unnorm, h_unnorm);
+
+    if (h_len_sq < 1e-6f)
+    {
+        pdf = diffuse_pdf * prob_diffuse;
+        return l;
+    }
+
+    float3 h       = h_unnorm * rsqrt(h_len_sq);
+    float n_dot_h  = max(dot(n, h), 0.001f);
+    float v_dot_h  = max(dot(v, h), 0.001f);
+    float alpha    = max(roughness * roughness, 0.001f);
+    float alpha2   = alpha * alpha;
+    float d_denom  = n_dot_h * n_dot_h * (alpha2 - 1.0f) + 1.0f;
+    float d        = alpha2 / (PI * d_denom * d_denom + 1e-6f);
+    float spec_pdf = d * n_dot_h / (4.0f * v_dot_h + 1e-6f);
+
+    pdf = prob_diffuse * diffuse_pdf + spec_prob * spec_pdf;
+    return l;
+}
+
+// full brdf*cos evaluator used at the primary vertex during shift and target-pdf evaluation
+// includes both diffuse and ggx specular, so metallic primaries receive proper gi contribution
+// (the reflection pipeline for pure mirror lobes should reconcile any overlap at shade time)
+float3 eval_surface_brdf_cos(float3 albedo, float roughness, float metallic, float3 normal, float3 view_dir, float3 dir)
+{
+    float n_dot_l = dot(normal, dir);
+    if (n_dot_l <= 0.0f)
+        return float3(0, 0, 0);
+
+    float unused_pdf;
+    return evaluate_brdf(albedo, roughness, metallic, normal, view_dir, dir, unused_pdf);
+}
+
+// lin 2022 reconnection conditions for reusing src's rc at a destination surface
+// the rc vertex roughness gate is enforced at sample construction, so at reuse time we only
+// need the stored rc flag and a minimum separation to keep the jacobian bounded
+bool can_reconnect_at_dst(PathSample src, float3 dst_pos, float dst_roughness)
+{
+    if (!has_reconnection(src))
+        return false;
+
+    float3 to_rc = src.rc_pos - dst_pos;
+    if (dot(to_rc, to_rc) < RESTIR_RC_MIN_DISTANCE * RESTIR_RC_MIN_DISTANCE)
+        return false;
+
+    return true;
+}
+
+struct ShiftResult
+{
+    float3 f_dst;
+    float  jacobian;
+    bool   ok;
+};
+
+// reconnection shift from source (its primary is src_primary_pos) to destination
+// returns ok=false if surfaces don't satisfy reconnection conditions or geometry is degenerate
+// visibility is checked separately via trace_shift_visibility so non-visibility-critical passes
+// (like target_pdf evaluation at a neighbor) can skip the ray cast
+ShiftResult try_reconnection_shift(
+    PathSample src,
+    float3 src_primary_pos,
+    float3 dst_pos,
+    float3 dst_normal,
+    float3 dst_view_dir,
+    float3 dst_albedo,
+    float dst_roughness,
+    float dst_metallic)
+{
+    ShiftResult result;
+    result.f_dst    = float3(0, 0, 0);
+    result.jacobian = 0.0f;
+    result.ok       = false;
+
+    if (is_sky_sample(src))
+    {
+        float3 dir = src.rc_pos;
+        if (dot(dst_normal, dir) <= RESTIR_RC_COS_FRONT)
+            return result;
+
+        float3 brdf_cos = eval_surface_brdf_cos(dst_albedo, dst_roughness, dst_metallic, dst_normal, dst_view_dir, dir);
+        if (all(brdf_cos <= 0.0f))
+            return result;
+
+        result.f_dst    = brdf_cos * src.rc_radiance;
+        result.jacobian = 1.0f;
+        result.ok       = true;
+        return result;
+    }
+
+    if (!can_reconnect_at_dst(src, dst_pos, dst_roughness))
+        return result;
+
+    float3 rc_from_src = src.rc_pos - src_primary_pos;
+    float3 rc_from_dst = src.rc_pos - dst_pos;
+
+    float dist_src_sq = dot(rc_from_src, rc_from_src);
+    float dist_dst_sq = dot(rc_from_dst, rc_from_dst);
+
+    if (dist_src_sq < 1e-4f || dist_dst_sq < RESTIR_RC_MIN_DISTANCE * RESTIR_RC_MIN_DISTANCE)
+        return result;
+
+    float dist_src = sqrt(dist_src_sq);
+    float dist_dst = sqrt(dist_dst_sq);
+
+    float3 dir_src = rc_from_src / dist_src;
+    float3 dir_dst = rc_from_dst / dist_dst;
+
+    if (dot(dst_normal, dir_dst) <= RESTIR_RC_COS_FRONT)
+        return result;
+
+    float cos_rc_src = dot(src.rc_normal, -dir_src);
+    float cos_rc_dst = dot(src.rc_normal, -dir_dst);
+
+    if (cos_rc_src <= RESTIR_RC_COS_FRONT || cos_rc_dst <= RESTIR_RC_COS_FRONT)
+        return result;
+
+    float3 brdf_cos = eval_surface_brdf_cos(dst_albedo, dst_roughness, dst_metallic, dst_normal, dst_view_dir, dir_dst);
+    if (all(brdf_cos <= 0.0f))
+        return result;
+
+    // solid-angle jacobian at rc: (cos_dst * dist_src^2) / (cos_src * dist_dst^2)
+    float jacobian = (cos_rc_dst * dist_src_sq) / max(cos_rc_src * dist_dst_sq, 1e-6f);
+    jacobian = clamp(jacobian, 0.0f, RESTIR_JACOBIAN_CLAMP);
+    if (jacobian <= 0.0f)
+        return result;
+
+    result.f_dst    = brdf_cos * src.rc_radiance;
+    result.jacobian = jacobian;
+    result.ok       = true;
+    return result;
+}
+
+// visibility ray from dst primary to rc
+// sky samples verify the direction is unoccluded to the sky, non-sky samples trace a segment
+// requires tlas to be bound in the caller (raygen or compute with inline ray tracing)
+bool trace_shift_visibility(PathSample src, float3 dst_pos, float3 dst_normal)
+{
+    float  offset = max(RESTIR_RAY_T_MIN, compute_ray_offset(dst_pos));
+    float3 dir;
+    float  t_max;
+
+    if (is_sky_sample(src))
+    {
+        dir   = src.rc_pos;
+        t_max = 10000.0f;
+    }
+    else
+    {
+        float3 to_rc = src.rc_pos - dst_pos;
+        float  dist  = length(to_rc);
+        if (dist < RESTIR_RC_MIN_DISTANCE)
+            return false;
+
+        dir   = to_rc / dist;
+        t_max = max(dist - offset * 2.0f, offset);
+    }
+
+    RayDesc ray;
+    ray.Origin    = dst_pos + dst_normal * offset;
+    ray.Direction = dir;
+    ray.TMin      = offset;
+    ray.TMax      = t_max;
+
+    RayQuery<RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH | RAY_FLAG_SKIP_CLOSEST_HIT_SHADER> query;
+    query.TraceRayInline(tlas, RAY_FLAG_NONE, 0xFF, ray);
+    query.Proceed();
+
+    return query.CommittedStatus() == COMMITTED_NOTHING;
+}
+
+// self-shift evaluation (jacobian == 1 by construction)
+// bypasses can_reconnect_at_dst since at the source pixel the path contribution is always
+// well-defined regardless of the rc roughness / distance gate (those only bound the jacobian)
+ShiftResult self_shift_evaluate(
+    PathSample src,
+    float3 dst_pos,
+    float3 dst_normal,
+    float3 dst_view_dir,
+    float3 dst_albedo,
+    float dst_roughness,
+    float dst_metallic)
+{
+    ShiftResult result;
+    result.f_dst    = float3(0, 0, 0);
+    result.jacobian = 1.0f;
+    result.ok       = false;
+
+    float3 dir;
+    if (is_sky_sample(src))
+    {
+        dir = src.rc_pos;
+    }
+    else
+    {
+        float3 to_rc = src.rc_pos - dst_pos;
+        float  d2    = dot(to_rc, to_rc);
+        if (d2 < 1e-8f)
+            return result;
+        dir = to_rc * rsqrt(d2);
+    }
+
+    if (dot(dst_normal, dir) <= 0.0f)
+        return result;
+
+    float3 brdf_cos = eval_surface_brdf_cos(dst_albedo, dst_roughness, dst_metallic, dst_normal, dst_view_dir, dir);
+    if (all(brdf_cos <= 0.0f))
+        return result;
+
+    result.f_dst = brdf_cos * src.rc_radiance;
+    result.ok    = true;
+    return result;
+}
+
+// luminance of f(y) at dst via reconnection shift (used for cross-pixel reuse)
+// for self-evaluation (src_primary_pos == dst_pos) use target_pdf_self instead so invalid-rc
+// samples still have a non-zero target at their own pixel
+float target_pdf_at_dst(
+    PathSample src,
+    float3 src_primary_pos,
+    float3 dst_pos,
+    float3 dst_normal,
+    float3 dst_view_dir,
+    float3 dst_albedo,
+    float dst_roughness,
+    float dst_metallic)
+{
+    ShiftResult r = try_reconnection_shift(src, src_primary_pos, dst_pos, dst_normal, dst_view_dir, dst_albedo, dst_roughness, dst_metallic);
+    if (!r.ok)
+        return 0.0f;
+
+    float lum = dot(r.f_dst, float3(0.299f, 0.587f, 0.114f));
+    return max(lum, 0.0f);
+}
+
+float target_pdf_self(
+    PathSample src,
+    float3 dst_pos,
+    float3 dst_normal,
+    float3 dst_view_dir,
+    float3 dst_albedo,
+    float dst_roughness,
+    float dst_metallic)
+{
+    ShiftResult r = self_shift_evaluate(src, dst_pos, dst_normal, dst_view_dir, dst_albedo, dst_roughness, dst_metallic);
+    if (!r.ok)
+        return 0.0f;
+
+    float lum = dot(r.f_dst, float3(0.299f, 0.587f, 0.114f));
+    return max(lum, 0.0f);
+}
+
+// shades the reservoir's sample at the current pixel (self-shift, jacobian == 1)
+// traces the visibility ray (sky samples verify sky reachability) and returns f(y) * W
+float3 shade_reservoir_path(Reservoir r, float3 dst_pos, float3 dst_normal, float3 dst_view_dir, float3 dst_albedo, float dst_roughness, float dst_metallic)
+{
+    if (r.M <= 0.0f || r.W <= 0.0f)
+        return float3(0, 0, 0);
+
+    ShiftResult shift = self_shift_evaluate(r.sample, dst_pos, dst_normal, dst_view_dir, dst_albedo, dst_roughness, dst_metallic);
+    if (!shift.ok)
+        return float3(0, 0, 0);
+
+    if (!trace_shift_visibility(r.sample, dst_pos, dst_normal))
+        return float3(0, 0, 0);
+
+    return shift.f_dst * r.W;
 }
 
 #endif // SPARTAN_RESTIR_RESERVOIR

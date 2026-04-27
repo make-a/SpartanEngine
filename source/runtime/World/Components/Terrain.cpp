@@ -22,7 +22,7 @@ CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 //= INCLUDES =================================
 #include "pch.h"
 #include "Terrain.h"
-#include "Renderable.h"
+#include "Render.h"
 #include "../Entity.h"
 #include "../World.h"
 #include "../../RHI/RHI_Texture.h"
@@ -874,16 +874,12 @@ namespace spartan
                         float nx      = -dh_dx, ny = 1.0f, nz = -dh_dz;
                         float inv_len = 1.0f / sqrtf(nx * nx + ny * ny + nz * nz);
                         nx *= inv_len; ny *= inv_len; nz *= inv_len;
-                        vertices[vertex_idx].nor[0] = nx;
-                        vertices[vertex_idx].nor[1] = ny;
-                        vertices[vertex_idx].nor[2] = nz;
-                        
+                        vertices[vertex_idx].set_normal(Vector3(nx, ny, nz));
+
                         float proj      = nx;
                         float tx        = 1.0f - nx * proj, ty = -ny * proj, tz = -nz * proj;
                         float t_inv_len = 1.0f / sqrtf(tx * tx + ty * ty + tz * tz);
-                        vertices[vertex_idx].tan[0] = tx * t_inv_len;
-                        vertices[vertex_idx].tan[1] = ty * t_inv_len;
-                        vertices[vertex_idx].tan[2] = tz * t_inv_len;
+                        vertices[vertex_idx].set_tangent(Vector3(tx * t_inv_len, ty * t_inv_len, tz * t_inv_len));
                     }
                 };
                 ThreadPool::ParallelLoop(compute_interior, interior_count);
@@ -924,16 +920,12 @@ namespace spartan
                     float nx      = -dh_dx, ny = 1.0f, nz = -dh_dz;
                     float inv_len = 1.0f / sqrtf(nx * nx + ny * ny + nz * nz);
                     nx *= inv_len; ny *= inv_len; nz *= inv_len;
-                    vertices[index].nor[0] = nx;
-                    vertices[index].nor[1] = ny;
-                    vertices[index].nor[2] = nz;
-                    
+                    vertices[index].set_normal(Vector3(nx, ny, nz));
+
                     float proj      = nx;
                     float tx        = 1.0f - nx * proj, ty = -ny * proj, tz = -nz * proj;
                     float t_inv_len = 1.0f / sqrtf(tx * tx + ty * ty + tz * tz);
-                    vertices[index].tan[0] = tx * t_inv_len;
-                    vertices[index].tan[1] = ty * t_inv_len;
-                    vertices[index].tan[2] = tz * t_inv_len;
+                    vertices[index].set_tangent(Vector3(tx * t_inv_len, ty * t_inv_len, tz * t_inv_len));
                 }
             };
             ThreadPool::ParallelLoop(compute_edges, edge_count);
@@ -1457,7 +1449,7 @@ namespace spartan
             entity->SetParent(GetEntity());
             entity->SetPosition(m_tile_offsets[tile_index]);
 
-            if (Renderable* renderable = entity->AddComponent<Renderable>())
+            if (Render* renderable = entity->AddComponent<Render>())
             {
                 renderable->SetMesh(m_mesh.get(), sub_mesh_index);
                 renderable->SetMaterial(m_material);
@@ -1488,7 +1480,7 @@ namespace spartan
 
         for (Entity* child : m_entity_ptr->GetChildren())
         {
-            if (Renderable* renderable = child->AddComponent<Renderable>())
+            if (Render* renderable = child->AddComponent<Render>())
                 renderable->SetMesh(nullptr);
         }
     }

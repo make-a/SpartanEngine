@@ -64,6 +64,7 @@ namespace spartan
         Screenshot,
         Gear,
         Play,
+        Pause,
         Profiler,
         ResourceCache,
         RenderDoc,
@@ -108,6 +109,7 @@ namespace spartan
         template <class T>
         static std::shared_ptr<T> GetByPath(const std::string& path)
         {
+            std::lock_guard<std::recursive_mutex> guard(GetMutex());
             for (std::shared_ptr<IResource>& resource : GetResources())
             {
                 if (path == resource->GetResourceFilePath())
@@ -129,13 +131,16 @@ namespace spartan
                 return nullptr;
             }
 
+            std::lock_guard<std::recursive_mutex> guard(GetMutex());
+
             // return cached resource if it already exists
-            std::shared_ptr<T> existing = GetByPath<T>(resource->GetResourceFilePath());
-            if (existing.get() != nullptr)
-                return existing;
+            for (std::shared_ptr<IResource>& existing : GetResources())
+            {
+                if (resource->GetResourceFilePath() == existing->GetResourceFilePath())
+                    return std::static_pointer_cast<T>(existing);
+            }
 
             // if not, cache it and return the cached resource
-            std::lock_guard<std::mutex> guard(GetMutex());
             return std::static_pointer_cast<T>(GetResources().emplace_back(resource));
         }
 
@@ -149,10 +154,15 @@ namespace spartan
                 return nullptr;
             }
 
-            // return cached resource if it already exists
-            const std::string name = FileSystem::GetFileNameWithoutExtensionFromFilePath(file_path);
-            std::shared_ptr<T> existing = GetByPath<T>(file_path);
-            if (existing.get() != nullptr)
+            // fast path, already cached
+            if (std::shared_ptr<T> existing = GetByPath<T>(file_path))
+                return existing;
+
+            // serialize concurrent loads of the same path so we don't decode the same file twice
+            std::lock_guard<std::mutex> in_flight_guard(GetInFlightMutex(file_path));
+
+            // re-check after taking the per-path lock, another thread may have completed the load while we waited
+            if (std::shared_ptr<T> existing = GetByPath<T>(file_path))
                 return existing;
 
             // create new resource
@@ -197,7 +207,8 @@ namespace spartan
 
         // misc
         static std::vector<std::shared_ptr<IResource>>& GetResources();
-        static std::mutex& GetMutex();
+        static std::recursive_mutex& GetMutex();
+        static std::mutex& GetInFlightMutex(const std::string& path);
         static bool GetUseRootShaderDirectory();
         static void SetUseRootShaderDirectory(const bool use_root_shader_directory);
         static RHI_Texture* GetIcon(IconType type);

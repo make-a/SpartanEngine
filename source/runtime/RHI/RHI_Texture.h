@@ -49,9 +49,10 @@ namespace spartan
         RHI_Texture_PerMipViews = 1U << 5,
         RHI_Texture_Greyscale   = 1U << 6,
         RHI_Texture_Transparent = 1U << 7,
-        RHI_Texture_Srgb        = 1U << 8,
-        RHI_Texture_Mappable    = 1U << 9,
-        RHI_Texture_Compress    = 1U << 10
+        RHI_Texture_Srgb              = 1U << 8,
+        RHI_Texture_Mappable          = 1U << 9,
+        RHI_Texture_ConcurrentSharing = 1U << 10, // shared between graphics and compute queue families
+        RHI_Texture_Compress          = 1U << 11
     };
 
     struct RHI_Texture_Mip
@@ -107,9 +108,13 @@ namespace spartan
         static bool IsCompressedFormat(const RHI_Format format);
         bool IsCompressedFormat()               { return IsCompressedFormat(m_format); }
 
+        RHI_Format GetCompressionFormat() const                    { return m_compression_format; }
+        void SetCompressionFormat(const RHI_Format format)         { m_compression_format = format; }
+
         // misc
         void ClearData();
         void PrepareForGpu();
+        void DestroyResourceImmediate();
         static size_t CalculateMipSize(uint32_t width, uint32_t height, uint32_t depth, RHI_Format format, uint32_t bits_per_channel, uint32_t channel_count);
 
         // data
@@ -149,8 +154,10 @@ namespace spartan
 
         // layout
         void SetLayout(const RHI_Image_Layout layout, RHI_CommandList* cmd_list, uint32_t mip_index = rhi_all_mips,  uint32_t mip_range = 0);
-        RHI_Image_Layout GetLayout(const uint32_t mip) const;
-        std::array<RHI_Image_Layout, rhi_max_mip_count> GetLayouts();
+        RHI_Image_Layout GetLayout(const uint32_t mip) const { return m_layouts[mip]; }
+        const std::array<RHI_Image_Layout, rhi_max_mip_count>& GetLayouts() const { return m_layouts; }
+        void SetLayoutDirect(uint32_t mip_index, uint32_t mip_range, RHI_Image_Layout layout);
+        void ClearLayouts();
 
         // viewport
         const auto& GetViewport() const { return m_viewport; }
@@ -158,10 +165,13 @@ namespace spartan
         // rhi
         RHI_Texture_Type GetType() const            { return m_type; }
         void*& GetRhiResource()                     { return m_rhi_resource; }
-        void* GetRhiSrv() const                     { return m_rhi_srv; }
-        void* GetRhiSrvMip(const uint32_t i) const  { return m_rhi_srv_mips[i]; }
-        void* GetRhiDsv(const uint32_t i = 0) const { return m_rhi_dsv[i]; }
-        void* GetRhiRtv(const uint32_t i = 0) const { return m_rhi_rtv[i]; }
+        void* GetRhiSrv() const                          { return m_rhi_srv; }
+        void* GetRhiSrvMip(const uint32_t i) const      { return m_rhi_srv_mips[i]; }
+        void* GetRhiSrvLayer(const uint32_t i) const     { return m_rhi_srv_layers[i]; }
+        void* GetRhiDsv(const uint32_t i = 0) const      { return m_rhi_dsv[i]; }
+        void* GetRhiRtv(const uint32_t i = 0) const      { return m_rhi_rtv[i]; }
+        void* GetRhiRtvMultiview() const             { return m_rhi_rtv_multiview; }
+        void* GetRhiDsvMultiview() const             { return m_rhi_dsv_multiview; }
         void RHI_DestroyResource();
         void*& GetMappedData() { return m_mapped_data; }
 
@@ -174,16 +184,21 @@ namespace spartan
         uint32_t m_mip_count        = 0;
         uint32_t m_bits_per_channel = 0;
         uint32_t m_channel_count    = 0;
-        RHI_Format m_format         = RHI_Format::Max;
-        RHI_Texture_Type m_type     = RHI_Texture_Type::Max;
+        RHI_Format m_format             = RHI_Format::Max;
+        RHI_Format m_compression_format = RHI_Format::Max;
+        RHI_Texture_Type m_type         = RHI_Texture_Type::Max;
         RHI_Viewport m_viewport;
+        std::array<RHI_Image_Layout, rhi_max_mip_count> m_layouts;
         std::vector<RHI_Texture_Slice> m_slices;
 
         // api resources
         void* m_rhi_srv                                          = nullptr;     // an srv with all mips
         std::array<void*, rhi_max_mip_count> m_rhi_srv_mips      = { nullptr }; // an srv for each mip
+        std::array<void*, rhi_max_render_target_count> m_rhi_srv_layers = { nullptr }; // per-layer srvs for array textures
         std::array<void*, rhi_max_render_target_count> m_rhi_rtv = { nullptr };
         std::array<void*, rhi_max_render_target_count> m_rhi_dsv = { nullptr };
+        void* m_rhi_rtv_multiview                                = nullptr;
+        void* m_rhi_dsv_multiview                                = nullptr;
         void* m_rhi_resource                                     = nullptr;
         void* m_mapped_data                                      = nullptr;
 

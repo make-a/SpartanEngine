@@ -38,6 +38,7 @@ void main_cs(uint3 thread_id : SV_DispatchThreadID)
     float3 light_specular      = 0.0f;
     float3 light_emissive      = 0.0f;
     float3 light_atmospheric   = 0.0f;
+    float3 light_gi            = 0.0f;
     float alpha                = 0.0f;
     float distance_from_camera = 0.0f;
 
@@ -53,17 +54,15 @@ void main_cs(uint3 thread_id : SV_DispatchThreadID)
     {
         light_diffuse        = tex3.SampleLevel(samplers[sampler_point_clamp], surface.uv, 0).rgb;
         light_specular       = tex4.SampleLevel(samplers[sampler_point_clamp], surface.uv, 0).rgb;
-        light_emissive       = surface.emissive * surface.albedo * 10.0f;
+        light_emissive       = surface.emissive * surface.albedo;
         alpha                = surface.alpha;
         distance_from_camera = surface.camera_to_pixel_length;
-        
-        // add ray traced global illumination (indirect diffuse)
-        // gi is treated as indirect irradiance, albedo is applied in final output below
-        // metals have no diffuse component, so scale by (1 - metallic)
+
+        // restir_pt outputs pre-shaded gi (diffuse_brdf * cos * radiance * W),
+        // so it bypasses the *albedo multiply below and is added directly
         if (is_restir_pt_enabled())
         {
-            float3 gi = tex6.SampleLevel(samplers[sampler_point_clamp], surface.uv, 0).rgb;
-            light_diffuse += gi * (1.0f - surface.metallic);
+            light_gi = tex6.SampleLevel(samplers[sampler_bilinear_clamp], surface.uv, 0).rgb;
         }
     }
     
@@ -72,7 +71,7 @@ void main_cs(uint3 thread_id : SV_DispatchThreadID)
         uint sky_mip = 4; // it just looks good
     
         // compute view direction
-        float3 camera_position = buffer_frame.camera_position;
+        float3 camera_position = get_camera_position();
         float3 view_dir        = normalize(surface.position - camera_position);
     
         // sample sky in view direction
@@ -110,5 +109,5 @@ void main_cs(uint3 thread_id : SV_DispatchThreadID)
 
     // transparent surfaces sample background via refraction, no need to blend
     float accumulate = (pass_is_transparent() && !surface.is_transparent()) ? 1.0f : 0.0f;
-    tex_uav[thread_id.xy] = validate_output(float4(light_diffuse * surface.albedo + light_specular + light_emissive + light_atmospheric, alpha) + tex_uav[thread_id.xy] * accumulate);
+    tex_uav[thread_id.xy] = validate_output(float4(light_diffuse * surface.albedo + light_specular + light_emissive + light_atmospheric + light_gi, alpha) + tex_uav[thread_id.xy] * accumulate);
 }

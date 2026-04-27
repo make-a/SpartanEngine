@@ -25,6 +25,7 @@ CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 #include "../RHI_Device.h"
 #include "../RHI_Texture.h"
 #include "../RHI_CommandList.h"
+#include "../../Core/Breadcrumbs.h"
 //================================
 
 //= NAMESPACES ===============
@@ -126,6 +127,34 @@ namespace spartan
             SP_ASSERT_MSG(vkCreateImageView(RHI_Context::device, &create_info, nullptr, reinterpret_cast<VkImageView*>(&image_view)) == VK_SUCCESS, "Failed to create image view");
         }
 
+        // creates a 2d view of a single layer from an array texture (for per-layer srv binding)
+        void create_image_view_2d_layer(
+            void* image,
+            void*& image_view,
+            const RHI_Texture* texture,
+            const uint32_t array_index,
+            const uint32_t mip_index,
+            const uint32_t mip_count
+        )
+        {
+            VkImageViewCreateInfo create_info           = {};
+            create_info.sType                           = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+            create_info.image                           = static_cast<VkImage>(image);
+            create_info.viewType                        = VK_IMAGE_VIEW_TYPE_2D;
+            create_info.format                          = vulkan_format[rhi_format_to_index(texture->GetFormat())];
+            create_info.subresourceRange.aspectMask     = get_aspect_mask(texture, texture->IsDepthFormat(), false);
+            create_info.subresourceRange.baseMipLevel   = mip_index;
+            create_info.subresourceRange.levelCount     = mip_count;
+            create_info.subresourceRange.baseArrayLayer = array_index;
+            create_info.subresourceRange.layerCount     = 1;
+            create_info.components.r = VK_COMPONENT_SWIZZLE_IDENTITY;
+            create_info.components.g = VK_COMPONENT_SWIZZLE_IDENTITY;
+            create_info.components.b = VK_COMPONENT_SWIZZLE_IDENTITY;
+            create_info.components.a = VK_COMPONENT_SWIZZLE_IDENTITY;
+
+            SP_ASSERT_MSG(vkCreateImageView(RHI_Context::device, &create_info, nullptr, reinterpret_cast<VkImageView*>(&image_view)) == VK_SUCCESS, "Failed to create per-layer image view");
+        }
+
         void set_debug_name(RHI_Texture* texture)
         {
             const char* name = texture->GetObjectName().c_str();
@@ -190,8 +219,8 @@ namespace spartan
                 }
             }
         
-            // create staging buffer with aligned size
-            RHI_Device::MemoryBufferCreate(staging_buffer, buffer_offset, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, nullptr, "staging_buffer_texture");
+            // acquire a staging buffer from the pool
+            staging_buffer = RHI_Device::StagingBufferAcquire(buffer_offset);
         
             void* mapped_data = nullptr;
             buffer_offset = 0;
@@ -206,10 +235,15 @@ namespace spartan
                     uint32_t mip_depth  = texture->GetType() == RHI_Texture_Type::Type3D ? (depth >> mip_index) : 1;
                     size_t size         = RHI_Texture::CalculateMipSize(mip_width, mip_height, mip_depth, texture->GetFormat(), texture->GetBitsPerChannel(), texture->GetChannelCount());
         
+                    // match the alignment used in the region offset calculation above,
+                    // otherwise the gpu reads from aligned offsets but the data sits elsewhere
+                    buffer_offset = (buffer_offset + buffer_alignment - 1) & ~(buffer_alignment - 1);
+
                     RHI_Texture_Mip* mip = texture->GetMip(array_index, mip_index);
                     if (mip && !mip->bytes.empty())
                     {
-                        memcpy(static_cast<std::byte*>(mapped_data) + buffer_offset, mip->bytes.data(), size);
+                        size_t copy_size = min(size, mip->bytes.size());
+                        memcpy(static_cast<std::byte*>(mapped_data) + buffer_offset, mip->bytes.data(), copy_size);
                     }
         
                     buffer_offset += size;
@@ -219,10 +253,22 @@ namespace spartan
             RHI_Device::MemoryUnmap(staging_buffer);
         }
 
+        static mutex stage_mutex;
+
         void stage(RHI_Texture* texture)
         {
             SP_ASSERT(texture->HasData());
-        
+
+            // only one staging buffer at a time to avoid exhausting host-visible memory
+            // (pcie bar, typically 256 mb) when many textures are uploaded in parallel
+            lock_guard<mutex> lock(stage_mutex);
+
+            {
+                char marker[128];
+                snprintf(marker, sizeof(marker), "texture_stage: %s", texture->GetObjectName().c_str());
+                Breadcrumbs::BeginMarker(marker);
+            }
+
             void* staging_buffer = nullptr;
         
             // determine region count
@@ -239,14 +285,18 @@ namespace spartan
             array<VkBufferImageCopy, MaxRegions> regions{};
         
             // copy data to staging buffer using stack array
+            Breadcrumbs::BeginMarker("texture_stage_copy_to_buffer");
             copy_to_staging_buffer(texture, regions, staging_buffer);
+            Breadcrumbs::EndMarker(); // copy_to_buffer
         
             // copy the staging buffer into the image
+            Breadcrumbs::BeginMarker("texture_stage_buffer_to_image");
             if (RHI_CommandList* cmd_list = RHI_CommandList::ImmediateExecutionBegin(RHI_Queue_Type::Graphics))
             {
                 RHI_Image_Layout layout = RHI_Image_Layout::Transfer_Destination;
         
-                cmd_list->InsertBarrier(texture->GetRhiResource(), texture->GetFormat(), 0, mip_count, depth, layout);
+                cmd_list->InsertBarrier(texture, layout, 0, mip_count);
+                cmd_list->FlushBarriers();
         
                 vkCmdCopyBufferToImage(
                     static_cast<VkCommandBuffer>(cmd_list->GetRhiResource()),
@@ -258,28 +308,30 @@ namespace spartan
                 );
         
                 RHI_CommandList::ImmediateExecutionEnd(cmd_list);
+
+                SP_ASSERT_MSG(texture->GetLayout(0) != RHI_Image_Layout::Max, "Layout not set after staging barrier");
             }
+            Breadcrumbs::EndMarker(); // buffer_to_image
         
-            if (staging_buffer)
-                RHI_Device::DeletionQueueAdd(RHI_Resource_Type::Buffer, staging_buffer);
+            RHI_Device::StagingBufferRelease(staging_buffer);
+
+            Breadcrumbs::EndMarker(); // texture_stage
         }
 
         RHI_Image_Layout GetAppropriateLayout(RHI_Texture* texture)
         {
-            RHI_Image_Layout target_layout = RHI_Image_Layout::Preinitialized;
+            // priority: uav (requires general) > rt (requires attachment) > srv (shader read)
+            // uav takes highest priority because vulkan mandates general layout for storage images
+            if (texture->IsUav())
+                return RHI_Image_Layout::General;
 
             if (texture->IsRt())
-            {
-                target_layout = RHI_Image_Layout::Attachment;
-            }
-
-            if (texture->IsUav())
-                target_layout = RHI_Image_Layout::General;
+                return RHI_Image_Layout::Attachment;
 
             if (texture->IsSrv())
-                target_layout = RHI_Image_Layout::Shader_Read;
+                return RHI_Image_Layout::Shader_Read;
 
-            return target_layout;
+            return RHI_Image_Layout::Preinitialized;
         }
     }
 
@@ -289,7 +341,9 @@ namespace spartan
         SP_ASSERT_MSG(m_height != 0, "Height can't be zero");
 
         // create image
+        Breadcrumbs::BeginMarker("texture_create_image");
         RHI_Device::MemoryTextureCreate(this);
+        Breadcrumbs::EndMarker(); // create_image
 
         // if the texture has any data, stage it
         if (HasData())
@@ -298,23 +352,31 @@ namespace spartan
         }
 
         // transition to target layout
+        Breadcrumbs::BeginMarker("texture_layout_transition");
         if (RHI_CommandList* cmd_list = RHI_CommandList::ImmediateExecutionBegin(RHI_Queue_Type::Graphics))
         {
-            uint32_t array_length = m_type == RHI_Texture_Type::Type3D ? 1 : m_depth;
-            cmd_list->InsertBarrier(
-                m_rhi_resource,
-                m_format,
-                0,            // mip start
-                m_mip_count,  // mip count
-                array_length, // array length
-                GetAppropriateLayout(this)
-            );
+            uint32_t array_length          = m_type == RHI_Texture_Type::Type3D ? 1 : m_depth;
+            RHI_Image_Layout target_layout = GetAppropriateLayout(this);
+
+            // empty srv-only textures: use general instead of shader_read to avoid the validation
+            // warning about transitioning from undefined (content-discarding) to a read-only layout.
+            // SetTexture() will transition to shader_read on first use.
+            if (!HasData() && target_layout == RHI_Image_Layout::Shader_Read)
+            {
+                target_layout = RHI_Image_Layout::General;
+            }
+
+            cmd_list->InsertBarrier(this, target_layout, 0, m_mip_count);
         
             // flush
             RHI_CommandList::ImmediateExecutionEnd(cmd_list);
+
+            SP_ASSERT_MSG(GetLayout(0) != RHI_Image_Layout::Max, "Layout not set after transition");
         }
+        Breadcrumbs::EndMarker(); // layout_transition
 
         // create image views
+        Breadcrumbs::BeginMarker("texture_create_views");
         {
             // shader resource views
             if (IsSrv() || IsUav())
@@ -326,6 +388,15 @@ namespace spartan
                     for (uint32_t i = 0; i < m_mip_count; i++)
                     {
                         create_image_view(m_rhi_resource, m_rhi_srv_mips[i], this, 0, m_depth, i, 1);
+                    }
+                }
+
+                // per-layer 2d views for array textures (used by compute passes to sample individual layers)
+                if (m_type == RHI_Texture_Type::Type2DArray && m_depth > 1)
+                {
+                    for (uint32_t i = 0; i < m_depth; i++)
+                    {
+                        create_image_view_2d_layer(m_rhi_resource, m_rhi_srv_layers[i], this, i, 0, m_mip_count);
                     }
                 }
             }
@@ -344,6 +415,20 @@ namespace spartan
                     if (IsDsv())
                     {
                         create_image_view(m_rhi_resource, m_rhi_dsv[i], this, i, 1, 0, 1);
+                    }
+                }
+
+                // full-array views for multiview rendering (covers all layers in a single view)
+                if (m_type == RHI_Texture_Type::Type2DArray && m_depth > 1)
+                {
+                    if (IsRtv())
+                    {
+                        create_image_view(m_rhi_resource, m_rhi_rtv_multiview, this, 0, m_depth, 0, 1);
+                    }
+
+                    if (IsDsv())
+                    {
+                        create_image_view(m_rhi_resource, m_rhi_dsv_multiview, this, 0, m_depth, 0, 1);
                     }
                 }
             }
@@ -365,6 +450,7 @@ namespace spartan
             // name the image and image view(s)
             set_debug_name(this);
         }
+        Breadcrumbs::EndMarker(); // create_views
 
         return true;
     }
@@ -381,6 +467,12 @@ namespace spartan
                 RHI_Device::DeletionQueueAdd(RHI_Resource_Type::ImageView, m_rhi_srv_mips[i]);
                 m_rhi_srv_mips[i] = nullptr;
             }
+
+            for (uint32_t i = 0; i < rhi_max_render_target_count; i++)
+            {
+                RHI_Device::DeletionQueueAdd(RHI_Resource_Type::ImageView, m_rhi_srv_layers[i]);
+                m_rhi_srv_layers[i] = nullptr;
+            }
         }
 
         // rtv and dsv
@@ -393,9 +485,72 @@ namespace spartan
             m_rhi_rtv[i] = nullptr;
         }
 
+        // multiview full-array views
+        RHI_Device::DeletionQueueAdd(RHI_Resource_Type::ImageView, m_rhi_rtv_multiview);
+        m_rhi_rtv_multiview = nullptr;
+        RHI_Device::DeletionQueueAdd(RHI_Resource_Type::ImageView, m_rhi_dsv_multiview);
+        m_rhi_dsv_multiview = nullptr;
+
         // rhi resource
-        RHI_CommandList::RemoveLayout(m_rhi_resource);
+        ClearLayouts();
         RHI_Device::DeletionQueueAdd(RHI_Resource_Type::Image, m_rhi_resource);
         m_rhi_resource = nullptr;
+    }
+
+    void RHI_Texture::DestroyResourceImmediate()
+    {
+        if (m_rhi_srv)
+        {
+            vkDestroyImageView(RHI_Context::device, static_cast<VkImageView>(m_rhi_srv), nullptr);
+            m_rhi_srv = nullptr;
+        }
+
+        for (uint32_t i = 0; i < m_mip_count; i++)
+        {
+            if (m_rhi_srv_mips[i])
+            {
+                vkDestroyImageView(RHI_Context::device, static_cast<VkImageView>(m_rhi_srv_mips[i]), nullptr);
+                m_rhi_srv_mips[i] = nullptr;
+            }
+        }
+
+        for (uint32_t i = 0; i < rhi_max_render_target_count; i++)
+        {
+            if (m_rhi_srv_layers[i])
+            {
+                vkDestroyImageView(RHI_Context::device, static_cast<VkImageView>(m_rhi_srv_layers[i]), nullptr);
+                m_rhi_srv_layers[i] = nullptr;
+            }
+
+            if (m_rhi_dsv[i])
+            {
+                vkDestroyImageView(RHI_Context::device, static_cast<VkImageView>(m_rhi_dsv[i]), nullptr);
+                m_rhi_dsv[i] = nullptr;
+            }
+
+            if (m_rhi_rtv[i])
+            {
+                vkDestroyImageView(RHI_Context::device, static_cast<VkImageView>(m_rhi_rtv[i]), nullptr);
+                m_rhi_rtv[i] = nullptr;
+            }
+        }
+
+        if (m_rhi_rtv_multiview)
+        {
+            vkDestroyImageView(RHI_Context::device, static_cast<VkImageView>(m_rhi_rtv_multiview), nullptr);
+            m_rhi_rtv_multiview = nullptr;
+        }
+
+        if (m_rhi_dsv_multiview)
+        {
+            vkDestroyImageView(RHI_Context::device, static_cast<VkImageView>(m_rhi_dsv_multiview), nullptr);
+            m_rhi_dsv_multiview = nullptr;
+        }
+
+        ClearLayouts();
+        if (m_rhi_resource)
+        {
+            RHI_Device::MemoryTextureDestroy(m_rhi_resource);
+        }
     }
 }

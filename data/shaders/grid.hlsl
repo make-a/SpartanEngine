@@ -45,8 +45,7 @@ PixelInput main_vs(Vertex_PosUvNorTan input)
 {
     PixelInput output;
 
-    input.position.w      = 1.0f;
-    output.position_world = mul(input.position, buffer_pass.transform);
+    output.position_world = mul(float4(input.position, 1.0f), draw_data[buffer_pass.draw_index].transform);
     output.position       = mul(output.position_world, buffer_frame.view_projection_unjittered);
 
     return output;
@@ -94,7 +93,7 @@ float4 main_ps(PixelInput input) : SV_TARGET
     color_output = lerp(color_output, color_axis_x, align_axis_x);
 
     // camera distance test
-    float camera_dist = length(buffer_frame.camera_position.xz - world_pos.xz);
+    float camera_dist = length(get_camera_position().xz - world_pos.xz);
     float alpha_dist  = 1.0 - smoothstep(0.0, max_camera_dist, camera_dist);
 
     float alpha = min(alpha_dist, alpha_grid);

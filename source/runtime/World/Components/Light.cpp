@@ -46,23 +46,30 @@ namespace spartan
         const float cascade_depth          = 1000.0f;
         const float cascade_far_max_extent = FLT_MAX;
 
-        float get_sensible_range(const LightType type)
+        float get_sensible_range(const LightType type, const float photometric_intensity = 0.0f, const float angle_rad = math::deg_to_rad * 30.0f)
         {
+            const float illuminance_cutoff_lux = 0.25f;
+            const float min_range              = 0.5f;
+
             if (type == LightType::Directional)
             {
                 return numeric_limits<float>::max();
             }
             else if (type == LightType::Point)
             {
-                return 15.0f;
+                const float denominator = 4.0f * pi * illuminance_cutoff_lux;
+                return max(min_range, sqrt(max(photometric_intensity, 0.0f) / denominator));
             }
             else if (type == LightType::Spot)
             {
-                return 15.0f;
+                const float solid_angle = 2.0f * pi * (1.0f - cos(max(angle_rad, 0.001f)));
+                const float candela     = max(photometric_intensity, 0.0f) / max(solid_angle, 0.001f);
+                return max(min_range, sqrt(candela / illuminance_cutoff_lux));
             }
             else if (type == LightType::Area)
             {
-                return 20.0f;
+                const float denominator = 2.0f * pi * illuminance_cutoff_lux;
+                return max(min_range, sqrt(max(photometric_intensity, 0.0f) / denominator));
             }
 
             return 0.0f;
@@ -95,7 +102,7 @@ namespace spartan
     {
         SP_REGISTER_ATTRIBUTE_VALUE_VALUE(m_flags, uint32_t);
         SP_REGISTER_ATTRIBUTE_VALUE_VALUE(m_range, float);
-        SP_REGISTER_ATTRIBUTE_VALUE_VALUE(m_intensity_lumens_lux, float);
+        SP_REGISTER_ATTRIBUTE_VALUE_VALUE(m_intensity_photometric, float);
         SP_REGISTER_ATTRIBUTE_VALUE_VALUE(m_angle_rad, float);
         SP_REGISTER_ATTRIBUTE_VALUE_VALUE(m_color_rgb, Color);
         SP_REGISTER_ATTRIBUTE_VALUE_VALUE(m_temperature_kelvin, float);
@@ -104,7 +111,6 @@ namespace spartan
         SP_REGISTER_ATTRIBUTE_VALUE_VALUE(m_far_cascade_min, math::Vector3);
         SP_REGISTER_ATTRIBUTE_VALUE_VALUE(m_far_cascade_max, math::Vector3);
         SP_REGISTER_ATTRIBUTE_VALUE_VALUE(m_is_active_previous_frame, bool);
-        SP_REGISTER_ATTRIBUTE_VALUE_VALUE(m_changed_this_frame, bool);
         SP_REGISTER_ATTRIBUTE_VALUE_VALUE(m_index, uint32_t);
         SP_REGISTER_ATTRIBUTE_VALUE_VALUE(m_area_width, float);
         SP_REGISTER_ATTRIBUTE_VALUE_VALUE(m_area_height, float);
@@ -115,19 +121,14 @@ namespace spartan
 
         SetColor(get_sensible_color(m_light_type));
         SetIntensity(LightIntensity::bulb_500_watt);
-        SetRange(get_sensible_range(m_light_type));
+        SetRange(get_sensible_range(m_light_type, m_intensity_photometric, m_angle_rad));
         SetFlag(LightFlags::Shadows);
-        SetFlag(LightFlags::ShadowsScreenSpace);
+        m_flags |= static_cast<uint32_t>(LightFlags::ShadowsScreenSpace);
     }
 
     Light::~Light()
     {
 
-    }
-
-    void Light::PreTick()
-    {
-        m_changed_this_frame = false;
     }
 
     void Light::Tick()
@@ -183,7 +184,7 @@ namespace spartan
         node.append_attribute("color_b")       = m_color_rgb.b;
         node.append_attribute("temperature")   = m_temperature_kelvin;
         node.append_attribute("intensity")     = static_cast<int>(m_intensity);
-        node.append_attribute("intensity_lum") = m_intensity_lumens_lux;
+        node.append_attribute("intensity_photometric") = m_intensity_photometric;
         node.append_attribute("range")         = m_range;
         node.append_attribute("angle")         = m_angle_rad;
         node.append_attribute("index")         = m_index;
@@ -191,7 +192,7 @@ namespace spartan
         node.append_attribute("area_width")    = m_area_width;
         node.append_attribute("area_height")   = m_area_height;
     }
-    
+
     void Light::Load(pugi::xml_node& node)
     {
         m_flags                = node.attribute("flags").as_uint(0);
@@ -200,20 +201,116 @@ namespace spartan
         m_color_rgb.g          = node.attribute("color_g").as_float(0.0f);
         m_color_rgb.b          = node.attribute("color_b").as_float(0.0f);
         m_temperature_kelvin   = node.attribute("temperature").as_float(0.0f);
-        m_intensity            = static_cast<LightIntensity>(node.attribute("intensity").as_int(static_cast<int>(LightIntensity::bulb_500_watt)));
-        m_intensity_lumens_lux = node.attribute("intensity_lum").as_float(2600.0f);
-        m_range                = node.attribute("range").as_float(32.0f);
+        m_intensity = static_cast<LightIntensity>(node.attribute("intensity").as_int(static_cast<int>(LightIntensity::bulb_500_watt)));
+
+        pugi::xml_attribute intensity_attribute = node.attribute("intensity_photometric");
+        if (!intensity_attribute)
+        {
+            intensity_attribute = node.attribute("intensity_lum");
+        }
+        m_intensity_photometric = intensity_attribute.as_float(2600.0f);
+        m_range                = node.attribute("range").as_float(get_sensible_range(m_light_type, m_intensity_photometric, m_angle_rad));
         m_angle_rad            = node.attribute("angle").as_float(math::deg_to_rad * 30.0f);
         m_index                = node.attribute("index").as_uint(0);
         m_preset               = static_cast<LightPreset>(node.attribute("preset").as_int(static_cast<int>(LightPreset::custom)));
         m_area_width           = node.attribute("area_width").as_float(1.0f);
         m_area_height          = node.attribute("area_height").as_float(1.0f);
-    
+        m_screen_space_shadows_slice_index = 0;
+
+        if (m_light_type != LightType::Directional || !(m_flags & LightFlags::Shadows))
+        {
+            m_flags &= ~static_cast<uint32_t>(LightFlags::ShadowsScreenSpace);
+        }
+
         UpdateMatrices(); // regenerate view/projection after loading
+    }
+
+    void Light::RegisterForScripting(sol::state_view State)
+    {
+        State.new_enum("LightType",
+            "Directional",              LightType::Directional,
+            "Point",                    LightType::Point,
+            "Spot",                     LightType::Spot,
+            "Area",                     LightType::Area,
+            "Max",                      LightType::Max
+        );
+
+        State.new_enum("LightIntensity",
+            "bulb_stadium",             LightIntensity::bulb_stadium,
+            "bulb_500_watt",            LightIntensity::bulb_500_watt,
+            "bulb_150_watt",            LightIntensity::bulb_150_watt,
+            "bulb_100_watt",            LightIntensity::bulb_100_watt,
+            "bulb_60_watt",             LightIntensity::bulb_60_watt,
+            "bulb_25_watt",             LightIntensity::bulb_25_watt,
+            "bulb_flashlight",          LightIntensity::bulb_flashlight,
+            "black_hole",               LightIntensity::black_hole,
+            "custom",                   LightIntensity::custom
+        );
+
+        State.new_enum("LightIntensityUnit",
+            "Lux",                      LightIntensityUnit::Lux,
+            "Lumens",                   LightIntensityUnit::Lumens
+        );
+
+
+        State.new_usertype<Light>("Light",
+            sol::base_classes,              sol::bases<Component>(),
+
+            "SetTemperature",               &Light::SetTemperature,
+            "GetTemperature",               &Light::GetTemperature,
+
+
+            "SetColor",                     &Light::SetColor,
+            "GetColor",                     &Light::GetColor,
+            "GetIntensityPhotometric",      &Light::GetIntensityPhotometric,
+            "GetIntensityLumens",           &Light::GetIntensityLumens,
+            "GetIntensityUnit",             &Light::GetIntensityUnit,
+            "GetIntensityRadiometric",      &Light::GetIntensityRadiometric,
+            "GetIntensityWatt",             &Light::GetIntensityWatt,
+
+            "SetIntensity",                 sol::overload(
+                [](Light& Self, float Lumens) { Self.SetIntensity(Lumens); },
+                [](Light& Self, LightIntensity Intensity) { Self.SetIntensity(Intensity); }),
+
+            "SetAngle",                     &Light::SetAngle,
+            "GetAngle",                     &Light::GetAngle,
+
+            "SetAreaWidth",                 &Light::SetAreaWidth,
+            "GetAreaWidth",                 &Light::GetAreaWidth,
+            "SetAreaHeight",                &Light::SetAreaHeight,
+            "GetAreaHeight",                &Light::GetAreaHeight,
+
+            "IsInViewFrustrum",             &Light::IsInViewFrustum,
+
+            "SetDrawDistance",              &Light::SetDrawDistance,
+            "GetDrawDistance",              &Light::GetDrawDistance,
+
+            "GetLightType",                 &Light::GetLightType,
+            "SetLightType",                 &Light::SetLightType,
+
+            "NeedsSkysphereUpdate",         &Light::NeedsSkysphereUpdate,
+            "GetSliceCount",                &Light::GetSliceCount,
+
+            "GetAtlasOffset",               &Light::GetAtlasOffset,
+            "GetAtlasScale",                &Light::GetAtlasScale,
+            "GetBoundingBox",               &Light::GetBoundingBox
+
+        );
+
+
+
+    }
+
+    sol::reference Light::AsLua(sol::state_view state)
+    {
+        return sol::make_reference(state, this);
     }
 
     void Light::SetFlag(const LightFlags flag, const bool enable)
     {
+        if (flag == LightFlags::ShadowsScreenSpace && enable && m_light_type != LightType::Directional)
+            return;
+
         bool enabled      = false;
         bool disabled     = false;
         bool flag_present = m_flags & flag;
@@ -240,8 +337,6 @@ namespace spartan
                     m_flags &= ~static_cast<uint32_t>(LightFlags::Volumetric);
                 }
             }
-
-            m_changed_this_frame = true;
         }
     }
 
@@ -253,7 +348,13 @@ namespace spartan
         m_light_type = type;
 
         SetColor(get_sensible_color(m_light_type));
-        SetRange(get_sensible_range(m_light_type));
+        SetRange(get_sensible_range(m_light_type, m_intensity_photometric, m_angle_rad));
+
+        if (m_light_type != LightType::Directional)
+        {
+            m_flags &= ~static_cast<uint32_t>(LightFlags::ShadowsScreenSpace);
+            m_screen_space_shadows_slice_index = 0;
+        }
 
         UpdateMatrices();
     }
@@ -262,8 +363,6 @@ namespace spartan
     {
         m_temperature_kelvin = temperature_kelvin;
         m_color_rgb          = Color(temperature_kelvin);
-
-        m_changed_this_frame = true;
     }
 
     void Light::SetColor(const Color& rgb)
@@ -292,8 +391,6 @@ namespace spartan
             m_temperature_kelvin = 2700.0f;
         else if (rgb == Color::light_photo_flash)
             m_temperature_kelvin = 5500.0f;
-
-        m_changed_this_frame = true;
     }
 
     void Light::SetIntensity(const LightIntensity intensity)
@@ -302,46 +399,47 @@ namespace spartan
 
         if (intensity == LightIntensity::bulb_stadium)
         {
-            m_intensity_lumens_lux = 200000.0f;
+            m_intensity_photometric = 200000.0f;
         }
         else if (intensity == LightIntensity::bulb_500_watt)
         {
-            m_intensity_lumens_lux = 8500.0f;
+            m_intensity_photometric = 8500.0f;
         }
         else if (intensity == LightIntensity::bulb_150_watt)
         {
-            m_intensity_lumens_lux = 2600.0f;
+            m_intensity_photometric = 2600.0f;
         }
         else if (intensity == LightIntensity::bulb_100_watt)
         {
-            m_intensity_lumens_lux = 1600.0f;
+            m_intensity_photometric = 1600.0f;
         }
         else if (intensity == LightIntensity::bulb_60_watt)
         {
-            m_intensity_lumens_lux = 800.0f;
+            m_intensity_photometric = 800.0f;
         }
         else if (intensity == LightIntensity::bulb_25_watt)
         {
-            m_intensity_lumens_lux = 200.0f;
+            m_intensity_photometric = 200.0f;
         }
         else if (intensity == LightIntensity::bulb_flashlight)
         {
-            m_intensity_lumens_lux = 100.0f;
+            m_intensity_photometric = 100.0f;
         }
         else // black hole
         {
-            m_intensity_lumens_lux = 0.0f;
+            m_intensity_photometric = 0.0f;
         }
-
-        m_changed_this_frame = true;
     }
 
-    void Light::SetIntensity(const float lumens_lux)
+    void Light::SetIntensity(const float photometric_intensity)
     {
-        m_intensity_lumens_lux = lumens_lux;
-        m_intensity            = LightIntensity::custom;
+        m_intensity_photometric = photometric_intensity;
+        m_intensity             = LightIntensity::custom;
+    }
 
-        m_changed_this_frame = true;
+    LightIntensityUnit Light::GetIntensityUnit() const
+    {
+        return m_light_type == LightType::Directional ? LightIntensityUnit::Lux : LightIntensityUnit::Lumens;
     }
 
     void Light::SetPreset(const LightPreset preset)
@@ -380,7 +478,7 @@ namespace spartan
             // nighttime with soft moonlight
             time_of_day = 0.875f; // 9:00 PM
             temperature = 4100.0f; // moonlight color
-            intensity = 0.3f; // lux - full moon
+            intensity = 0.25f; // lux - full moon
             break;
 
         case LightPreset::david_lynch:
@@ -410,41 +508,54 @@ namespace spartan
             // elevation from time of day
             float elevation_rad = (time_of_day * 360.0f - 90.0f) * math::deg_to_rad;
             Quaternion elevation = Quaternion::FromAxisAngle(Vector3::Right, elevation_rad);
-            
+
             // horizontal rotation (yaw)
             Quaternion yaw = Quaternion::FromAxisAngle(Vector3::Up, yaw_degrees * math::deg_to_rad);
-            
+
             // combine: yaw first, then elevation
             GetEntity()->SetRotation(yaw * elevation);
             UpdateMatrices();
         }
-
-        m_changed_this_frame = true;
     }
 
-    float Light::GetIntensityWatt() const
+    float Light::GetIntensityRadiometric() const
     {
-        // ideal luminous efficacy of monochromatic radiation at 555 nm (lm/w).
-        // note: for broad spectrum white light, ~250-400 is more accurate,
-        // but 683 is the standard "ideal" definition used in engines like ue5/frostbite
-        const float luminous_efficacy = 683.0f; 
-    
-        // 1. convert photometric (lumens/lux) to radiometric (watts)
-        float radiant_flux = m_intensity_lumens_lux / luminous_efficacy;
-    
+        // use the same 683 lm/w white-light approximation that the display path uses.
+        // this keeps the engine's photometric authoring and shader radiometric math in sync.
+        const float luminous_efficacy = 683.0f;
+        const float photometric_intensity = max(m_intensity_photometric, 0.0f);
+
         if (m_light_type == LightType::Directional)
         {
-            // directional: input is lux (lm/m^2), output is irradiance (w/m^2)
-            // no solid angle conversion needed
-            return radiant_flux;
+            // directional lights store illuminance in lux.
+            return photometric_intensity / luminous_efficacy;
         }
-        else
+
+        // convert luminous flux to radiant flux.
+        float radiant_flux = photometric_intensity / luminous_efficacy;
+
+        if (m_light_type == LightType::Point)
         {
-            // point/spot: input is lumens (lm) -> flux (watts)
-            // we need radiant intensity (watts/sr)
-            // divide by 4pi to distribute flux over the sphere
-            return radiant_flux / (4.0f * 3.14159265359f);
+            // point lights emit isotropically across the full sphere.
+            return radiant_flux / (4.0f * pi);
         }
+
+        if (m_light_type == LightType::Spot)
+        {
+            // spot lights store total beam flux in lumens.
+            // distribute that beam over the actual cone solid angle so narrowing the cone raises candela.
+            float solid_angle = 2.0f * pi * (1.0f - cos(max(m_angle_rad, 0.001f)));
+            return radiant_flux / max(solid_angle, 0.001f);
+        }
+
+        if (m_light_type == LightType::Area)
+        {
+            // area lights currently store one-sided emitted flux in lumens.
+            // until the shader uses a proper area emitter model, approximate distribution over the front hemisphere.
+            return radiant_flux / (2.0f * pi);
+        }
+
+        return radiant_flux / (4.0f * pi);
     }
 
     void Light::SetRange(float range)
@@ -494,22 +605,22 @@ namespace spartan
 
         static Quaternion last_rotation           = Quaternion::Identity;
         static Color last_color_rgb               = Color::standard_black;
-        static float last_intensity_lumens_lux    = numeric_limits<float>::max();
-    
+        static float last_intensity_photometric   = numeric_limits<float>::max();
+
         Quaternion current_rotation = GetEntity() ? GetEntity()->GetRotation() : Quaternion::Identity;
-    
+
         bool rotation_changed  = current_rotation != last_rotation;
         bool color_changed     = m_color_rgb != last_color_rgb;
-        bool intensity_changed = abs(m_intensity_lumens_lux - last_intensity_lumens_lux) > 0.01f;
-    
+        bool intensity_changed = abs(m_intensity_photometric - last_intensity_photometric) > 0.01f;
+
         if (rotation_changed || color_changed || intensity_changed)
         {
             last_rotation             = current_rotation;
             last_color_rgb            = m_color_rgb;
-            last_intensity_lumens_lux = m_intensity_lumens_lux;
+            last_intensity_photometric = m_intensity_photometric;
             return true;
         }
-    
+
         return false;
     }
 
@@ -541,8 +652,6 @@ namespace spartan
         UpdateViewMatrix();
         UpdateProjectionMatrix();
         UpdateBoundingBox();
-
-        m_changed_this_frame = true;
     }
 
     void Light::UpdateViewMatrix()
@@ -554,20 +663,20 @@ namespace spartan
             Camera* camera = World::GetCamera();
             if (!camera)
                 return;
-    
+
             // both cascades follow the camera
             Vector3 camera_pos = camera->GetEntity()->GetPosition();
             Vector3 position   = camera_pos - GetEntity()->GetForward() * cascade_depth * 0.5f;
             m_matrix_view[0]   = Matrix::CreateLookAtLH(position, camera_pos, Vector3::Up);
             m_matrix_view[1]   = m_matrix_view[0];
-    
+
             // move the light in words units per texel to avoid shimmering
             {
                 // compute shadow extents (both fixed sizes)
                 float extents[2];
                 extents[0] = cascade_near_extent; // near cascade: fixed
                 extents[1] = cascade_far_extent;  // far cascade: fixed, bigger than near
-                
+
                 float atlas_width = static_cast<float>(Renderer::GetRenderTarget(Renderer_RenderTarget::shadow_atlas)->GetWidth());
                 for (uint32_t i  = 0; i < 2; i++)
                 {
@@ -606,7 +715,7 @@ namespace spartan
             m_matrix_view[5] = Matrix::CreateLookAtLH(position, position + Vector3::Backward, Vector3::Up);
         }
     }
-    
+
     void Light::UpdateProjectionMatrix()
     {
         if (m_light_type == LightType::Directional)
@@ -633,7 +742,7 @@ namespace spartan
             // area lights use orthographic projection based on their dimensions
             float half_width  = m_area_width * 0.5f;
             float half_height = m_area_height * 0.5f;
-            
+
             m_matrix_projection[0] = Matrix::CreateOrthoOffCenterLH(
                 -half_width, half_width,
                 -half_height, half_height,
@@ -657,7 +766,7 @@ namespace spartan
     void Light::UpdateBoundingBox()
     {
         const Vector3 position = GetEntity()->GetPosition();
-    
+
         if (m_light_type == LightType::Point)
         {
             const float radius = m_range;
@@ -669,63 +778,64 @@ namespace spartan
         else if (m_light_type == LightType::Spot)
         {
             const float opposite = m_range * tan(m_angle_rad);
-    
+
             const Vector3 pos_tip    = position;
             const Vector3 pos_center = pos_tip    + GetEntity()->GetForward() * m_range;
             const Vector3 pos_up     = pos_center + GetEntity()->GetUp()      * opposite;
             const Vector3 pos_down   = pos_center + GetEntity()->GetDown()    * opposite;
             const Vector3 pos_right  = pos_center + GetEntity()->GetRight()   * opposite;
             const Vector3 pos_left   = pos_center + GetEntity()->GetLeft()    * opposite;
-    
+
             Vector3 min = pos_tip;
             Vector3 max = pos_tip;
-    
+
             auto expand = [&](const Vector3& p)
             {
                 min = Vector3::Min(min, p);
                 max = Vector3::Max(max, p);
             };
-    
+
             expand(pos_center);
             expand(pos_up);
             expand(pos_down);
             expand(pos_right);
             expand(pos_left);
-    
+
             m_bounding_box = math::BoundingBox(min, max);
         }
         else if (m_light_type == LightType::Area)
         {
-            // area light bounding box extends from the light rectangle to its range
+            // area lights emit in a hemisphere so the influence volume fans out with distance,
+            // use the range as the lateral spread at the far end to avoid premature frustum culling
             const float half_width  = m_area_width * 0.5f;
             const float half_height = m_area_height * 0.5f;
-    
-            // corners of the area light rectangle
+
             const Vector3 right   = GetEntity()->GetRight();
             const Vector3 up      = GetEntity()->GetUp();
             const Vector3 forward = GetEntity()->GetForward();
-    
+
             Vector3 min = position;
             Vector3 max = position;
-    
+
             auto expand = [&](const Vector3& p)
             {
                 min = Vector3::Min(min, p);
                 max = Vector3::Max(max, p);
             };
-    
-            // expand by corners of the light rectangle
+
+            // near end: the area light rectangle itself
             expand(position + right * half_width + up * half_height);
             expand(position - right * half_width + up * half_height);
             expand(position + right * half_width - up * half_height);
             expand(position - right * half_width - up * half_height);
-    
-            // expand by the range in the forward direction
-            expand(position + forward * m_range + right * half_width + up * half_height);
-            expand(position + forward * m_range - right * half_width + up * half_height);
-            expand(position + forward * m_range + right * half_width - up * half_height);
-            expand(position + forward * m_range - right * half_width - up * half_height);
-    
+
+            // far end: expand laterally by range to cover the hemispheric spread
+            const Vector3 far_center = position + forward * m_range;
+            expand(far_center + right * m_range + up * m_range);
+            expand(far_center - right * m_range + up * m_range);
+            expand(far_center + right * m_range - up * m_range);
+            expand(far_center - right * m_range - up * m_range);
+
             m_bounding_box = math::BoundingBox(min, max);
         }
         else // directional
@@ -734,13 +844,13 @@ namespace spartan
         }
     }
 
-    bool Light::IsInViewFrustum(Renderable* renderable, const uint32_t array_index) const
+    bool Light::IsInViewFrustum(Render* renderable, const uint32_t array_index) const
     {
         const BoundingBox& bounding_box = renderable->GetBoundingBox();
         const Vector3 center            = bounding_box.GetCenter();
         const Vector3 extents           = bounding_box.GetExtents();
         const bool ignore_depth         = m_light_type == LightType::Directional; // orthographic
-        
+
         return m_frustums[array_index].IsVisible(center, extents, ignore_depth);
     }
 }

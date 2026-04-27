@@ -24,29 +24,59 @@ CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 #include "common_tessellation.hlsl"
 //=================================
 
-gbuffer_vertex main_vs(Vertex_PosUvNorTan input, uint instance_id : SV_InstanceID)
+#ifdef INDIRECT_DRAW
+gbuffer_vertex main_vs(uint vertex_id : SV_VertexID, uint view_id : SV_ViewID)
 {
-    gbuffer_vertex vertex;
-    
-    // transform to world space
+    MeshletInstance mi;
+    Vertex_PosUvNorTan input = pull_visible_triangle_vertex(vertex_id, mi);
+    uint instance_id         = mi.instance_index;
+#else
+gbuffer_vertex main_vs(Vertex_PosUvNorTan input, uint instance_id : SV_InstanceID, uint view_id : SV_ViewID)
+{
+    _draw = draw_data[buffer_pass.draw_index];
+#endif
+
     float3 position_world          = 0.0f;
     float3 position_world_previous = 0.0f;
-    vertex                         = transform_to_world_space(input, instance_id, buffer_pass.transform, position_world, position_world_previous);
-
-    // transform to clip space
-    vertex = transform_to_clip_space(vertex, position_world, position_world_previous);
-
-    return vertex;
+    gbuffer_vertex vertex          = transform_to_world_space(input, instance_id, _draw.transform, position_world, position_world_previous);
+    vertex.material_index          = _draw.material_index;
+    return transform_to_clip_space(vertex, position_world, position_world_previous, view_id);
 }
 
+#ifdef ALPHA_TEST_INDIRECT
+// indirect path discards based on material flags read from the bindless material parameters
+// non-alpha-tested materials early out so they only pay vertex cost in the prepass
 void main_ps(gbuffer_vertex vertex)
 {
+    pass_load_draw_data_from_vertex(vertex.material_index);
+
+    MaterialParameters material = GetMaterial();
+    if (!material.is_alpha_tested())
+        return;
+
+    const float2 screen_uv      = vertex.position.xy / (buffer_frame.resolution_render * buffer_frame.resolution_scale);
+    const float3 position_world = get_position_for_view(vertex.position.z, screen_uv, vertex.view_id);
+    const float alpha_threshold = get_alpha_threshold(position_world);
+
+    float a = GET_TEXTURE(material_texture_index_albedo).Sample(samplers[sampler_anisotropic_wrap], vertex.uv_misc.xy).a;
+    if (a <= alpha_threshold)
+        discard;
+}
+#else
+void main_ps(gbuffer_vertex vertex)
+{
+    pass_load_draw_data_from_vertex(vertex.material_index);
+
     // distance based alpha threshold
+    // in multiview the depth prepass is drawn once for both eyes, so buffer_pass.eye_index is
+    // static and cannot be used to pick the right eye's inverse vp; drive the per-fragment
+    // eye from the interpolated SV_ViewID (vertex.view_id) instead.
     const bool has_albedo       = pass_get_f3_value().y == 1.0f;
-    const float2 screen_uv      = vertex.position.xy / buffer_frame.resolution_render;
-    const float3 position_world = get_position(vertex.position.z, screen_uv);
+    const float2 screen_uv      = vertex.position.xy / (buffer_frame.resolution_render * buffer_frame.resolution_scale);
+    const float3 position_world = get_position_for_view(vertex.position.z, screen_uv, vertex.view_id);
     const float alpha_threshold = get_alpha_threshold(position_world);
 
     if (has_albedo && GET_TEXTURE(material_texture_index_albedo).Sample(samplers[sampler_anisotropic_wrap], vertex.uv_misc.xy).a <= alpha_threshold)
         discard;
 }
+#endif

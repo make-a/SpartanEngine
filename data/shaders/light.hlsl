@@ -34,9 +34,18 @@ float sample_cloud_shadow(float3 world_pos)
     if (buffer_frame.cloud_shadows <= 0.0 || buffer_frame.cloud_coverage <= 0.0)
         return 1.0;
     
-    // cloud shadow map covers 10km x 10km area centered on camera
+    // cloud shadow map covers 10km x 10km area
     float shadow_map_size = 10000.0;
-    float2 relative_pos = world_pos.xz - buffer_frame.camera_position.xz;
+    
+    // get shadow map dimensions for texel size calculation
+    float2 shadow_dims;
+    tex3.GetDimensions(shadow_dims.x, shadow_dims.y);
+    float texel_size = shadow_map_size / shadow_dims.x;
+    
+    // snap center to texel grid (must match cloud_shadow.hlsl)
+    float2 snapped_center = floor(buffer_frame.camera_position.xz / texel_size) * texel_size;
+    
+    float2 relative_pos = world_pos.xz - snapped_center;
     float2 uv = relative_pos / shadow_map_size + 0.5;
     
     // out of bounds check
@@ -156,7 +165,7 @@ void main_cs(uint3 thread_id : SV_DispatchThreadID)
         {
             // compute shadow term
             // for directional lights: ray traced shadows are mutually exclusive with rasterized/screen-space shadows
-            bool use_ray_traced_shadow = light.is_directional() && is_ray_traced_shadows_enabled();
+            bool use_ray_traced_shadow = light.is_directional() && light.has_shadows() && is_ray_traced_shadows_enabled();
             
             if (use_ray_traced_shadow)
             {
@@ -191,6 +200,16 @@ void main_cs(uint3 thread_id : SV_DispatchThreadID)
             AngularInfo angular_info;
             angular_info.Build(light, surface);
 
+            // for area lights, widen the specular distribution to match the light's angular
+            // extent - this prevents the highlight from collapsing into a concentrated point
+            float original_roughness       = surface.roughness;
+            float original_roughness_alpha = surface.roughness_alpha;
+            if (light.is_area())
+            {
+                surface.roughness_alpha = light.compute_area_roughness_modification(surface.roughness_alpha, light.distance_to_pixel);
+                surface.roughness       = sqrt(surface.roughness_alpha);
+            }
+
             // compute specular brdf lobes
             {
                 // main specular lobe (anisotropic or isotropic)
@@ -221,6 +240,10 @@ void main_cs(uint3 thread_id : SV_DispatchThreadID)
                     L_subsurface += subsurface_scattering(surface, light, angular_info);
                 }
             }
+
+            // restore original roughness so other lights aren't affected
+            surface.roughness       = original_roughness;
+            surface.roughness_alpha = original_roughness_alpha;
             
             // compute diffuse brdf term
             L_diffuse_term += BRDF_Diffuse(surface, angular_info);

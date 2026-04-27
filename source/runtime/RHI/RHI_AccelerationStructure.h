@@ -64,13 +64,19 @@ namespace spartan
         RHI_AccelerationStructure(const RHI_AccelerationStructureType type, const char* name);
         ~RHI_AccelerationStructure();
 
-        void BuildBottomLevel(RHI_CommandList* cmd_list, const std::vector<RHI_AccelerationStructureGeometry>& geometries, const std::vector<uint32_t>& primitive_counts);
+        void BuildBottomLevel(RHI_CommandList* cmd_list, const std::vector<RHI_AccelerationStructureGeometry>& geometries, const std::vector<uint32_t>& primitive_counts, bool allow_update = false);
+        void RefitBottomLevel(RHI_CommandList* cmd_list, const std::vector<RHI_AccelerationStructureGeometry>& geometries, const std::vector<uint32_t>& primitive_counts);
         void BuildTopLevel(RHI_CommandList* cmd_list, const std::vector<RHI_AccelerationStructureInstance>& instances);
 
         // misc
         uint64_t GetDeviceAddress();
         void* GetRhiResource() const                  { return m_rhi_resource; }
         RHI_AccelerationStructureType GetType() const { return m_type; }
+        bool CanRefit() const                         { return m_allow_update && m_rhi_resource; }
+
+        // releases the global shared scratch buffer used by static blas builds
+        // call after a build burst completes to reclaim that memory
+        static void FreeSharedBlasScratch();
 
     private:
         void Destroy();
@@ -78,17 +84,26 @@ namespace spartan
         // misc
         RHI_AccelerationStructureType m_type = RHI_AccelerationStructureType::Max;
         uint64_t m_size                      = 0;
+        bool m_allow_update                  = false;
 
         // rhi
         void* m_rhi_resource         = nullptr;
         void* m_rhi_resource_results = nullptr;
 
-        // reusable buffers
-        void* m_scratch_buffer          = nullptr;
-        uint64_t m_scratch_buffer_size  = 0;
-        void* m_instance_buffer         = nullptr;
-        uint64_t m_instance_buffer_size = 0;
-        void* m_staging_buffer          = nullptr;
-        uint64_t m_staging_buffer_size  = 0;
+        // reusable buffers - double buffered to avoid frame-to-frame synchronization issues
+        // when frame N is being processed by the GPU while frame N+1 updates the buffers
+        static const uint32_t buffer_count = 2;
+        uint32_t m_buffer_index            = 0;
+        void* m_scratch_buffer                                    = nullptr;
+        uint64_t m_scratch_buffer_size                            = 0;
+        std::array<void*, buffer_count> m_instance_buffer         = {};
+        std::array<uint64_t, buffer_count> m_instance_buffer_size = {};
+        std::array<void*, buffer_count> m_staging_buffer          = {};
+        std::array<uint64_t, buffer_count> m_staging_buffer_size  = {};
+
+        // shared scratch across all blas builds, grows monotonically
+        // building 2148 blas with per-instance scratch oom'd the gpu, sharing one keeps it bounded
+        static void* s_blas_scratch_buffer;
+        static uint64_t s_blas_scratch_buffer_size;
     };
 }

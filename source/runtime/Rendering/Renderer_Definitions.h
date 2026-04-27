@@ -27,58 +27,14 @@ CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
 namespace spartan
 {
-    const uint32_t renderer_resource_frame_lifetime = 100;
-    const uint32_t renderer_max_draw_calls          = 20000;
-    const uint32_t renderer_max_instance_count      = 1024;
-
-    enum class Renderer_Option : uint32_t
-    {
-        Aabb,
-        PickingRay,
-        Grid,
-        TransformHandle,
-        SelectionOutline,
-        Lights,
-        AudioSources,
-        PerformanceMetrics,
-        Physics,
-        Wireframe,
-        Bloom,
-        Fog,
-        ScreenSpaceAmbientOcclusion,
-        ScreenSpaceReflections,
-        RayTracedReflections,
-        MotionBlur,
-        DepthOfField,
-        FilmGrain,
-        Vhs,
-        ChromaticAberration,
-        Anisotropy,
-        Tonemapping,
-        AntiAliasing_Upsampling,
-        Sharpness,
-        Dithering,
-        Hdr,
-        WhitePoint,
-        Gamma,
-        Vsync,
-        VariableRateShading,
-        ResolutionScale,
-        DynamicResolution,
-        OcclusionCulling,
-        AutoExposureAdaptationSpeed,
-        // volumetric clouds
-        CloudAnimation, // whether clouds animate (wind movement)
-        CloudCoverage,  // 0=no clouds, >0=clouds visible
-        CloudType,
-        CloudShadows,
-        CloudColorR,
-        CloudColorG,
-        CloudColorB,
-        CloudDarkness,
-        CloudSeed,      // seed for cloud generation
-        Max
-    };
+    const uint32_t renderer_resource_frame_lifetime    = 100;
+    const uint32_t renderer_max_draw_calls            = 20000;
+    const uint32_t renderer_max_instance_count        = 1024;
+    const uint32_t renderer_draw_data_buffer_count    = 4; // matches the command list pool size to avoid cpu-gpu memcpy races
+    const uint32_t renderer_max_indirect_draws        = 131072;  // capacity for per-renderable lod draw data, the cull shader clamps writes to this
+    const uint32_t renderer_max_cull_tasks            = 524288;  // capacity for per-(renderable, meshlet) cull tasks, drives the meshlet cull dispatch size
+    const uint32_t renderer_max_meshlet_instances     = 1048576; // capacity for the meshlet cull survivor list, hw-instancing fans out into this so it can exceed renderer_max_cull_tasks
+    const uint32_t renderer_max_visible_triangles     = 8388608; // capacity for the triangle cull survivor list, sized as a worst-case practical cap not as max_meshlet_instances * 124
 
     enum class Renderer_Tonemapping : uint32_t
     {
@@ -135,16 +91,17 @@ namespace spartan
         bindless_material_parameters = 16,
         bindless_light_parameters    = 17,
         bindless_aabbs               = 18,
+        bindless_draw_data           = 19,
         
         // volumetric clouds 3D noise
-        tex3d_cloud_shape  = 19,
-        tex3d_cloud_detail = 20,
+        tex3d_cloud_shape  = 20,
+        tex3d_cloud_detail = 21,
         // restir reservoir srv bindings (for temporal/spatial read)
-        reservoir_prev0    = 21,
-        reservoir_prev1    = 22,
-        reservoir_prev2    = 23,
-        reservoir_prev3    = 24,
-        reservoir_prev4    = 25,
+        reservoir_prev0    = 22,
+        reservoir_prev1    = 23,
+        reservoir_prev2    = 24,
+        reservoir_prev3    = 25,
+        reservoir_prev4    = 26,
     };
 
     enum class Renderer_BindingsUav
@@ -155,7 +112,6 @@ namespace spartan
         tex4          = 3,
         tex3d         = 4,
         tex_sss       = 5,
-        visibility    = 6,
         sb_spd        = 7,
         tex_spd       = 8,
         geometry_info = 20, // ray tracing geometry info buffer
@@ -165,13 +121,31 @@ namespace spartan
         reservoir2    = 23,
         reservoir3    = 24,
         reservoir4    = 25,
-        // nrd output bindings
-        nrd_viewz              = 26,
-        nrd_normal_roughness   = 27,
-        nrd_diff_radiance      = 28,
-        nrd_spec_radiance      = 29,
         // integer format textures (vrs, etc)
         tex_uint               = 30,
+        // gpu-driven indirect drawing
+        // indirect_draw_args is a single-slot args buffer for the final non-indexed indirect draw, vertex_count is bumped by triangle cull
+        // meshlet_instances holds the meshlet-cull survivors, the triangle cull dispatches one workgroup per entry
+        // visible_triangles holds packed (meshlet_instance, triangle_in_meshlet) tuples emitted by triangle cull
+        // triangle_dispatch_args is the indirect dispatch args buffer for the triangle cull pass
+        indirect_draw_args     = 31,
+        indirect_draw_data     = 32,
+        meshlet_instances      = 33,
+        visible_triangles      = 34,
+        triangle_dispatch_args = 35,
+        // gpu-driven particles
+        particle_buffer_a      = 36,
+        particle_buffer_b      = 37,
+        particle_counter       = 38,
+        particle_emitter       = 39,
+        // gpu texture compression
+        compress_input         = 40,
+        compress_output        = 41,
+        compress_output_bc1    = 42,
+        // per-meshlet bounds for gpu-driven culling
+        meshlet_bounds         = 43,
+        // per-instance cull tasks for gpu-driven culling
+        cull_tasks             = 44,
     };
 
     enum class Renderer_Shader : uint8_t
@@ -182,6 +156,7 @@ namespace spartan
         gbuffer_p,
         depth_prepass_v,
         depth_prepass_alpha_test_p,
+        depth_prepass_indirect_alpha_test_p,
         depth_light_v,
         depth_light_alpha_color_p,
         fxaa_c,
@@ -223,7 +198,6 @@ namespace spartan
         ffx_spd_min_c,
         ffx_spd_max_c,
         blit_c,
-        occlusion_c,
         icon_c,
         dithering_c,
         transparency_reflection_refraction_c,
@@ -241,13 +215,29 @@ namespace spartan
         restir_pt_ray_hit_r,
         restir_pt_temporal_c,
         restir_pt_spatial_c,
+        restir_pt_denoise_temporal_c,
+        restir_pt_denoise_spatial_c,
         // volumetric clouds
         cloud_noise_shape_c,
         cloud_noise_detail_c,
         cloud_shadow_c,
         light_reflections_c,
-        // nrd denoiser
-        nrd_prepare_c,
+        // gpu-driven indirect rendering
+        indirect_cull_c,
+        indirect_cull_triangle_c,
+        gbuffer_indirect_v,
+        gbuffer_indirect_p,
+        depth_prepass_indirect_v,
+        meshlet_visualize_v,
+        meshlet_visualize_p,
+        // gpu-driven particles
+        particle_emit_c,
+        particle_simulate_c,
+        particle_render_c,
+        // gpu texture compression
+        texture_compress_bc1_c,
+        texture_compress_bc3_c,
+        texture_compress_bc5_c,
         max
     };
     
@@ -290,6 +280,9 @@ namespace spartan
         ray_traced_shadows,
         // restir path tracing output
         restir_output,
+        restir_denoised,
+        restir_denoised_history,
+        restir_denoised_ping,
         // restir reservoir buffers (current frame)
         restir_reservoir0,
         restir_reservoir1,
@@ -312,15 +305,10 @@ namespace spartan
         cloud_noise_shape,
         cloud_noise_detail,
         cloud_shadow,
-        // nrd denoiser textures
-        nrd_viewz,
-        nrd_normal_roughness,
-        nrd_diff_radiance_hitdist,
-        nrd_spec_radiance_hitdist,
-        nrd_out_diff_radiance_hitdist,
-        nrd_out_spec_radiance_hitdist,
         // debug
         debug_output,
+        // vr stereo
+        frame_output_stereo,
         max
     };
 
@@ -331,7 +319,7 @@ namespace spartan
         Point_clamp_border,
         Point_wrap,
         Bilinear_clamp_edge,
-        Bilienar_clamp_border,
+        Bilinear_clamp_border,
         Bilinear_wrap,
         Trilinear_clamp,
         Anisotropic_wrap,
@@ -346,10 +334,19 @@ namespace spartan
         LightParameters,
         DummyInstance,
         AABBs,
-        Visibility,
-        VisibilityPrev,
-        VisibilityReadback,
         GeometryInfo,
+        IndirectDrawArgs,          // single-slot args buffer for the final non-indexed indirect draw
+        IndirectDrawData,          // per-renderable lod draw data
+        MeshletInstances,          // meshlet-cull survivor list, the triangle cull pass dispatches one workgroup per entry
+        VisibleTriangles,          // triangle-cull survivor list, one packed (meshlet_instance, triangle_in_meshlet) per entry
+        TriangleDispatchArgs,      // single-slot indirect dispatch args buffer driving the triangle cull pass
+        CullTasks,                 // per (renderable, meshlet) cull tasks consumed by the meshlet cull compute shader
+        DrawData,                  // bindless per-draw data (transforms, material index, etc.)
+        // gpu-driven particles
+        ParticleBufferA,
+        ParticleBufferB,
+        ParticleCounter,
+        ParticleEmitter,
         Max
     };
 
@@ -399,16 +396,17 @@ namespace spartan
         Average
     };
 
-    class Renderable;
+    class Render;
     struct Renderer_DrawCall
     {
-        Renderable* renderable  = nullptr;
-        uint32_t instance_index = 0;
-        uint32_t instance_count = 0;
-        uint32_t lod_index      = 0;
-        float distance_squared  = 0.0f;
-        bool is_occluder        = false;
-        bool camera_visible     = false;
+        Render* renderable   = nullptr;
+        uint32_t instance_index  = 0;
+        uint32_t instance_count  = 0;
+        uint32_t lod_index       = 0;
+        uint32_t draw_data_index = 0; // index into the bindless draw data buffer
+        float distance_squared   = 0.0f;
+        bool is_occluder         = false;
+        bool camera_visible      = false;
     };
 
 }

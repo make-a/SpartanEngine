@@ -25,6 +25,7 @@ CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 #include "Core/Timer.h"
 #include "RHI/RHI_Device.h"
 #include "Rendering/Renderer.h"
+#include "World/World.h"
 #include "../ImGui/ImGui_Extension.h"
 //===================================
 
@@ -79,8 +80,11 @@ namespace
         option_second_column();
         ImGui::PushID(static_cast<int>(ImGui::GetCursorPosY()));
         bool value = ConsoleRegistry::Get().GetAs<float>(render_option) != 0.0f;
-        ImGui::Checkbox("", &value);
-        ConsoleRegistry::Get().SetValueFromString(render_option, value ? "1" : "0");
+        // only write on user interaction, otherwise an async cvar update (eg world load) can be reverted
+        if (ImGuiSp::toggle_switch("", &value))
+        {
+            ConsoleRegistry::Get().SetValueFromString(render_option, value ? "1" : "0");
+        }
         ImGui::PopID();
     }
 
@@ -95,7 +99,7 @@ namespace
 
         option_second_column();
         ImGui::PushID(static_cast<int>(ImGui::GetCursorPosY()));
-        ImGui::Checkbox("", &value);
+        ImGuiSp::toggle_switch("", &value);
         ImGui::PopID();
     }
 
@@ -136,11 +140,11 @@ namespace
             changed = ImGui::InputFloat("", &value, step, 0.0f, format);
             ImGui::PopItemWidth();
             ImGui::PopID();
-            value = clamp(value, min, max);
 
-            // only update if changed
-            if (ConsoleRegistry::Get().GetAs<float>(render_option) != value)
+            // only write on user interaction, otherwise an async cvar update (eg world load) can be reverted
+            if (changed)
             {
+                value = clamp(value, min, max);
                 ConsoleRegistry::Get().SetValueFromString(render_option, to_string(value));
             }
         }
@@ -269,7 +273,7 @@ void RenderOptions::OnTickVisible()
                         "Off",   // AA_Off_Upscale_Linear
                         "FXAA",  // AA_Fxaa_Upscale_Linear
                         "FSR 3", // AA_Fsr_Upscale_Fsr
-                        "XeSS 2" // AA_Xess_Upscale_Xess
+                        "XeSS 3" // AA_Xess_Upscale_Xess
                     };
 
                     Vector2 res_render = Renderer::GetResolutionRender();
@@ -289,9 +293,27 @@ void RenderOptions::OnTickVisible()
                 if (option_header("Ray-traced Effects"))
                 {
                     ImGui::BeginDisabled(!RHI_Device::IsSupportedRayTracing());
+                    static vector<string> restir_debug_modes =
+                    {
+                        "Off",
+                        "Confidence",
+                        "Reservoir M",
+                        "Reservoir W",
+                        "Reuse Ratio",
+                        "Temporal Rejection"
+                    };
+
                     option_check_box("Reflections", "r.ray_traced_reflections");
                     option_check_box("Shadows", "r.ray_traced_shadows");
                     option_check_box("ReSTIR Path Tracing (WIP)", "r.restir_pt");
+                    ImGui::BeginDisabled(!cvar_restir_pt.GetValueAs<bool>());
+                    option_value("ReSTIR resolution scale", "r.restir_pt_scale", "Fraction of render resolution used for path tracing (0.1-1.0)", 0.05f, 0.1f, 1.0f, "%.2f");
+                    uint32_t restir_debug_mode = cvar_restir_pt_debug_mode.GetValueAs<uint32_t>();
+                    if (option_combo_box("ReSTIR debug view", restir_debug_modes, restir_debug_mode, "Visualize reservoir state and temporal rejection"))
+                    {
+                        ConsoleRegistry::Get().SetValueFromString("r.restir_pt_debug_mode", to_string(static_cast<float>(restir_debug_mode)));
+                    }
+                    ImGui::EndDisabled();
                     ImGui::EndDisabled();
                 }
 
@@ -322,7 +344,7 @@ void RenderOptions::OnTickVisible()
                     ImGui::BeginDisabled(cvar_hdr.GetValueAs<bool>());
                     option_value("Gamma", "r.gamma");
                     ImGui::EndDisabled();
-                    option_value("Exposure adaptation speed", "r.auto_exposure_adaptation_speed", "Negative value disables adaptation", 0.1f, -1.0f);
+                    option_value("Exposure adaptation speed", "r.auto_exposure_adaptation_speed", "0 or negative disables adaptation", 0.1f, -1.0f);
                 }
 
                 if (option_header("Tone Mapping"))
@@ -379,27 +401,13 @@ void RenderOptions::OnTickVisible()
 
                 if (option_header("Volumetric Clouds"))
                 {
-                    option_check_box("Enable", "r.clouds_enabled", "Enable volumetric clouds");
-                    
-                    ImGui::BeginDisabled(!cvar_clouds_enabled.GetValueAs<bool>());
-                    option_value("Coverage", "r.cloud_coverage", "Sky coverage (0=no clouds, 1=overcast)", 0.05f, 0.0f, 1.0f, "%.2f");
-                    option_value("Cloud Type", "r.cloud_type", "0=stratus (flat), 0.5=stratocumulus, 1=cumulus (billowy)", 0.05f, 0.0f, 1.0f, "%.2f");
-                    option_check_box("Enable Animation", "r.cloud_animation", "Animate clouds with wind (performance cost)");
-                    option_value("Seed", "r.cloud_seed", "Change to regenerate clouds", 1.0f, 1.0f, 100.0f, "%.0f");
-                    
-                    ImGui::BeginDisabled(cvar_cloud_coverage.GetValue() <= 0.0f);
+                    option_value("Coverage", "r.cloud_coverage", "Sky coverage (0=clear, 1=overcast)", 0.05f, 0.0f, 1.0f, "%.2f");
                     option_value("Shadow Intensity", "r.cloud_shadows", "Cloud shadow intensity on ground", 0.1f, 0.0f, 2.0f, "%.2f");
-                    option_value("Darkness", "r.cloud_darkness", "Self-shadowing darkness blend", 0.05f, 0.0f, 1.0f, "%.2f");
-                    option_value("Color R", "r.cloud_color_r", "Cloud base color red", 0.05f, 0.0f, 1.0f, "%.2f");
-                    option_value("Color G", "r.cloud_color_g", "Cloud base color green", 0.05f, 0.0f, 1.0f, "%.2f");
-                    option_value("Color B", "r.cloud_color_b", "Cloud base color blue", 0.05f, 0.0f, 1.0f, "%.2f");
-                    ImGui::EndDisabled();
-                    ImGui::EndDisabled();
                 }
 
                 if (option_header("Wind"))
                 {
-                    Vector3 wind = Renderer::GetWind();
+                    Vector3 wind = World::GetWind();
                     float strength = wind.Length();
                     float direction = atan2f(wind.x, wind.z) * (180.0f / 3.14159f);
 
@@ -412,10 +420,10 @@ void RenderOptions::OnTickVisible()
                         float radians = direction * (3.14159f / 180.0f);
                         wind.x = sinf(radians) * strength;
                         wind.z = cosf(radians) * strength;
-                        Renderer::SetWind(wind);
+                        World::SetWind(wind);
                     }
                     
-                    ImGuiSp::tooltip("Wind affects cloud movement and shape evolution");
+                    ImGuiSp::tooltip("Wind affects clouds, vegetation, and cloth simulation");
                 }
 
                 ImGui::EndTable();
@@ -464,7 +472,21 @@ void RenderOptions::OnTickVisible()
                     option_check_box("Physics", "r.physics");
                     option_check_box("AABBs", "r.aabb");
                     option_check_box("Wireframe", "r.wireframe");
-                    option_check_box("Occlusion culling", "r.occlusion_culling", "For development purposes");
+                    option_check_box("Occlusion culling", "r.hiz_occlusion", "For development purposes");
+
+                    static const vector<string> meshlet_visualize_modes =
+                    {
+                        "Off",
+                        "Color by meshlet id",
+                        "Wireframe (meshlet id)",
+                        "Color by post-cull draw id",
+                        "Wireframe (draw id)"
+                    };
+                    uint32_t meshlet_mode = cvar_meshlet_visualize.GetValueAs<uint32_t>();
+                    if (option_combo_box("Meshlet visualization", meshlet_visualize_modes, meshlet_mode, "Writes hashed meshlet colors to debug_output, view it in Texture Viewer"))
+                    {
+                        ConsoleRegistry::Get().SetValueFromString("r.meshlet_visualize", to_string(static_cast<float>(meshlet_mode)));
+                    }
                 }
 
                 ImGui::EndTable();

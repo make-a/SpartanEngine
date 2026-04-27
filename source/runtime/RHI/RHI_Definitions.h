@@ -321,8 +321,12 @@ namespace spartan
         MaterialParameters,
         LightParameters,
         Aabbs,
+        DrawData,
         SamplersComparison,
         SamplersRegular,
+        GeometryVertices,
+        GeometryIndices,
+        Instances,
         Max
     };
 
@@ -607,7 +611,7 @@ namespace spartan
     const uint32_t rhi_stencil_load              = std::numeric_limits<uint32_t>::infinity();
     const uint8_t  rhi_max_render_target_count   = 8;
     const uint8_t  rhi_max_constant_buffer_count = 8;
-    const uint32_t rhi_max_array_size            = 4096;
+    const uint32_t rhi_max_array_size            = 16384;
     const uint32_t rhi_max_descriptor_set_count  = 512;
     const uint32_t  rhi_max_mip_count            = 13;
     const uint32_t rhi_all_mips                  = std::numeric_limits<uint32_t>::max();

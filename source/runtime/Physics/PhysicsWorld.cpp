@@ -26,6 +26,7 @@ CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 #include "../Profiling/Profiler.h"
 #include "../Rendering/Renderer.h"
 #include "../Input/Input.h"
+#include "../World/Entity.h"
 #include "../World/Components/Camera.h"
 #include "../World/Components/Physics.h"
 #include "../World/World.h"
@@ -204,13 +205,29 @@ namespace spartan
         static PxPhysics* physics                 = nullptr;
         static PxScene* scene                     = nullptr;
         static PxDefaultCpuDispatcher* dispatcher = nullptr;
+
+        // word2 tags for collision filtering
+        // 1 = character controller, 2 = vehicle
+        // only suppress contacts between character and vehicle; everything else is default
+        PxFilterFlags collision_filter_shader(
+            PxFilterObjectAttributes attributes0, PxFilterData filter_data0,
+            PxFilterObjectAttributes attributes1, PxFilterData filter_data1,
+            PxPairFlags& pair_flags, const void* constant_block, PxU32 constant_block_size)
+        {
+            bool is_character_vs_vehicle =
+                (filter_data0.word2 == 1 && filter_data1.word2 == 2) ||
+                (filter_data0.word2 == 2 && filter_data1.word2 == 1);
+
+            if (is_character_vs_vehicle)
+                return PxFilterFlag::eSUPPRESS;
+
+            return PxDefaultSimulationFilterShader(attributes0, filter_data0, attributes1, filter_data1,
+                pair_flags, constant_block, constant_block_size);
+        }
     }
 
     void PhysicsWorld::Initialize()
     {
-        // register physx library
-        Settings::RegisterThirdPartyLib("PhysX", to_string(PX_PHYSICS_VERSION_MAJOR) + "." + to_string(PX_PHYSICS_VERSION_MINOR) + "." + to_string(PX_PHYSICS_VERSION_BUGFIX), "https://github.com/NVIDIA-Omniverse/PhysX");
-
         // foundation
         foundation = PxCreateFoundation(PX_PHYSICS_VERSION, allocator, logger);
         SP_ASSERT(foundation);
@@ -223,7 +240,7 @@ namespace spartan
         PxSceneDesc scene_desc(physics->getTolerancesScale());
         scene_desc.gravity        = PxVec3(0.0f, settings::gravity, 0.0f);
         scene_desc.cpuDispatcher  = PxDefaultCpuDispatcherCreate(2);
-        scene_desc.filterShader   = PxDefaultSimulationFilterShader;
+        scene_desc.filterShader   = collision_filter_shader;
         scene_desc.flags         |= PxSceneFlag::eENABLE_CCD; // enable continuous collision detection to reduce tunneling
         scene                     = physics->createScene(scene_desc);
         SP_ASSERT(scene);
@@ -272,13 +289,21 @@ namespace spartan
 
         if (Engine::IsFlagSet(EngineMode::Playing))
         {
-            // simulation
+            // simulation (frozen while paused)
             {
                 const float fixed_time_step   = 1.0f / settings::hz;
                 static float accumulated_time = 0.0f;
 
+                if (Engine::IsFlagSet(EngineMode::Paused))
+                {
+                    accumulated_time = 0.0f;
+                }
+
                 // accumulate delta time
-                accumulated_time += static_cast<float>(Timer::GetDeltaTimeSec());
+                if (!Engine::IsFlagSet(EngineMode::Paused))
+                {
+                    accumulated_time += static_cast<float>(Timer::GetDeltaTimeSec());
+                }
 
                 // perform simulation steps
                 while (accumulated_time >= fixed_time_step)
@@ -306,9 +331,14 @@ namespace spartan
                 picking::MovePickedBody();
             }
         }
-        else if (cvar_physics.GetValueAs<bool>())
+
+        // debug visualization (editor only, skip during play)
+        if (cvar_physics.GetValueAs<bool>() && !Engine::IsFlagSet(EngineMode::Playing))
         {
-            // render debug visuals (accessing while the simulation is running can result in undefined behavior)
+            // run a near-zero step so physx populates the render buffer (physx requires dt > 0)
+            scene->simulate(numeric_limits<float>::min());
+            scene->fetchResults(true);
+
             const PxRenderBuffer& rb = scene->getRenderBuffer();
             for (PxU32 i = 0; i < rb.getNbLines(); i++)
             {
@@ -362,5 +392,41 @@ namespace spartan
     float PhysicsWorld::GetInterpolationAlpha()
     {
         return interpolation::alpha;
+    }
+
+    bool PhysicsWorld::RaycastStatic(const Vector3& origin, const Vector3& direction, float max_distance, Vector3& hit_position)
+    {
+        Entity* unused = nullptr;
+        return RaycastStatic(origin, direction, max_distance, hit_position, unused);
+    }
+
+    bool PhysicsWorld::RaycastStatic(const Vector3& origin, const Vector3& direction, float max_distance, Vector3& hit_position, Entity*& hit_entity)
+    {
+        hit_entity = nullptr;
+
+        if (!scene)
+            return false;
+
+        PxVec3 px_origin(origin.x, origin.y, origin.z);
+        PxVec3 px_direction(direction.x, direction.y, direction.z);
+        px_direction.normalize();
+
+        PxRaycastBuffer hit;
+        PxQueryFilterData filter_data(PxQueryFlag::eSTATIC);
+
+        lock_guard<mutex> lock(scene_mutex);
+        if (scene->raycast(px_origin, px_direction, max_distance, hit, PxHitFlag::eDEFAULT, filter_data) && hit.hasBlock)
+        {
+            hit_position = Vector3(hit.block.position.x, hit.block.position.y, hit.block.position.z);
+
+            if (hit.block.actor && hit.block.actor->userData)
+            {
+                hit_entity = static_cast<Entity*>(hit.block.actor->userData);
+            }
+
+            return true;
+        }
+
+        return false;
     }
 }

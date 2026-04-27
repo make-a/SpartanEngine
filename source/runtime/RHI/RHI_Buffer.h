@@ -84,6 +84,9 @@ namespace spartan
         void Update(RHI_CommandList* cmd_list, void* data_cpu, const uint32_t size = 0);
         void ResetOffset() { m_offset = 0; first_update = true; }
 
+        // copy data into a sub-region of this buffer (for vertex/index buffers)
+        void UploadSubRegion(const void* data, uint64_t offset_bytes, uint64_t size_bytes);
+
         // ray tracing
         RHI_StridedDeviceAddressRegion GetRegion(const RHI_Shader_Type group_type, const uint32_t stride_extra = 0) const;
         void UpdateHandles(RHI_CommandList* cmd_list);
@@ -96,6 +99,7 @@ namespace spartan
         void* GetMappedData() const         { return m_data_gpu; }
         void* GetRhiResource() const        { return m_rhi_resource; }
         RHI_Buffer_Type GetType() const     { return m_type; }
+        void DestroyResourceImmediate();
         uint64_t GetDeviceAddress() const   { return m_device_address; }
 
     private:

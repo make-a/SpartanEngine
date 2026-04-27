@@ -41,8 +41,6 @@ namespace spartan
     { 
         bool m_has_loaded_user_settings = false;
         string file_path                = "spartan.xml";
-        vector<third_party_lib> m_third_party_libs;
-        mutex mutex_register;
 
         // helper to convert cvar name to xml-safe name (e.g., "r.bloom" -> "r_bloom")
         string cvar_name_to_xml(const char* name)
@@ -74,7 +72,14 @@ namespace spartan
                 {
                     if (name.size() >= 2 && name[0] == 'r' && name[1] == '.')
                     {
-                        root.append_child(cvar_name_to_xml(string(name).c_str()).c_str()).text().set(get<float>(*cvar.m_value_ptr));
+                        float value = get<float>(*cvar.m_value_ptr);
+
+                        if (name == "r.resolution_scale" && cvar_dynamic_resolution.GetValueAs<bool>())
+                        {
+                            value = 1.0f;
+                        }
+
+                        root.append_child(cvar_name_to_xml(string(name).c_str()).c_str()).text().set(value);
                     }
                 }
 
@@ -108,6 +113,7 @@ namespace spartan
 
                 Renderer::SetResolutionRender(root.child("ResolutionRenderWidth").text().as_int(), root.child("ResolutionRenderHeight").text().as_int());
                 Renderer::SetResolutionOutput(root.child("ResolutionOutputWidth").text().as_int(), root.child("ResolutionOutputHeight").text().as_int());
+                bool dynamic_resolution = root.child("r_dynamic_resolution").text().as_bool();
 
                 // load render options from xml
                 for (const auto& [name, cvar] : ConsoleRegistry::Get().GetAll())
@@ -117,7 +123,14 @@ namespace spartan
                         pugi::xml_node child = root.child(cvar_name_to_xml(string(name).c_str()).c_str());
                         if (child)
                         {
-                            ConsoleRegistry::Get().SetValueFromString(string(name).c_str(), child.text().as_string());
+                            if (name == "r.resolution_scale" && dynamic_resolution)
+                            {
+                                ConsoleRegistry::Get().SetValueFromString(string(name).c_str(), "1.0");
+                            }
+                            else
+                            {
+                                ConsoleRegistry::Get().SetValueFromString(string(name).c_str(), child.text().as_string());
+                            }
                         }
                     }
                 }
@@ -130,10 +143,21 @@ namespace spartan
         }
     }
 
+    void Settings::LoadPreInitSettings()
+    {
+        if (!FileSystem::Exists(file_path))
+            return;
+
+        pugi::xml_document doc;
+        if (!doc.load_file(file_path.c_str()))
+            return;
+
+        pugi::xml_node root = doc.child("Settings");
+        ResourceCache::SetUseRootShaderDirectory(root.child("UseRootShaderDirectory").text().as_bool());
+    }
+
     void Settings::Initialize()
     {
-        RegisterThirdPartyLib("pugixml", "1.13", "https://github.com/zeux/pugixml");
-
         if (FileSystem::Exists(file_path))
         {
             load();
@@ -143,26 +167,6 @@ namespace spartan
     void Settings::Shutdown()
     {
         save();
-    }
-
-    void Settings::RegisterThirdPartyLib(const string& name, const string& version, const string& url)
-    {
-        lock_guard<mutex> lock(mutex_register);
-
-        m_third_party_libs.emplace_back(name, version, url);
-
-        // maintain alphabetical order
-        sort(m_third_party_libs.begin(), m_third_party_libs.end(),
-            [](const third_party_lib& a, const third_party_lib& b)
-            {
-                return a.name < b.name;
-            }
-        );
-    }
-
-    const vector<third_party_lib>& Settings::GetThirdPartyLibs()
-    {
-        return m_third_party_libs;
     }
 
     bool Settings::HasLoadedUserSettingsFromFile()
