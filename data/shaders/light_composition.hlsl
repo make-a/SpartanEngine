@@ -24,6 +24,67 @@ CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 #include "fog.hlsl"
 //====================
 
+// edge-aware bilateral upsample of the half-res restir gi texture (tex6)
+// destination depth and normal come from the full-res g-buffer via Surface
+// source depth and normal are read at gi texel centers from the same g-buffer
+// weights combine bilinear, depth similarity, normal similarity to avoid edge bleed
+float3 sample_gi_bilateral(float2 uv_dst, float depth_dst_lin, float3 normal_dst)
+{
+    float2 gi_size; tex6.GetDimensions(gi_size.x, gi_size.y);
+    float2 gi_inv = 1.0f / gi_size;
+
+    float2 ctr  = uv_dst * gi_size - 0.5f;
+    float2 base = floor(ctr);
+    float2 frac_uv = ctr - base;
+
+    int2 corners[4];
+    corners[0] = int2(base) + int2(0, 0);
+    corners[1] = int2(base) + int2(1, 0);
+    corners[2] = int2(base) + int2(0, 1);
+    corners[3] = int2(base) + int2(1, 1);
+
+    float w_bilin[4];
+    w_bilin[0] = (1.0f - frac_uv.x) * (1.0f - frac_uv.y);
+    w_bilin[1] = frac_uv.x          * (1.0f - frac_uv.y);
+    w_bilin[2] = (1.0f - frac_uv.x) * frac_uv.y;
+    w_bilin[3] = frac_uv.x          * frac_uv.y;
+
+    float3 sum  = 0.0f;
+    float  norm = 0.0f;
+
+    int2 gi_max = int2(gi_size) - 1;
+    [unroll]
+    for (int i = 0; i < 4; i++)
+    {
+        int2 c = clamp(corners[i], int2(0, 0), gi_max);
+        float2 src_uv = (float2(c) + 0.5f) * gi_inv;
+
+        float d_raw = tex_depth.SampleLevel(samplers[sampler_point_clamp], src_uv, 0).r;
+        if (d_raw <= 0.0f) continue;
+
+        float d_lin = linearize_depth(d_raw);
+        float3 n_src = get_normal(src_uv);
+
+        float depth_diff = abs(d_lin - depth_dst_lin) / max(depth_dst_lin, 1e-3f);
+        float w_depth    = exp(-depth_diff * 64.0f);
+
+        float ndot     = saturate(dot(normal_dst, n_src));
+        float w_normal = pow(ndot, 16.0f);
+
+        float w = w_bilin[i] * w_depth * w_normal;
+
+        float3 src = tex6.Load(int3(c, 0)).rgb;
+        sum  += src * w;
+        norm += w;
+    }
+
+    if (norm > 1e-5f)
+        return sum / norm;
+
+    // all neighbors disagree on geometry, fall back to nearest texel to avoid halos
+    return tex6.SampleLevel(samplers[sampler_point_clamp], uv_dst, 0).rgb;
+}
+
 [numthreads(THREAD_GROUP_COUNT_X, THREAD_GROUP_COUNT_Y, 1)]
 void main_cs(uint3 thread_id : SV_DispatchThreadID)
 {
@@ -45,7 +106,16 @@ void main_cs(uint3 thread_id : SV_DispatchThreadID)
     // during the compute pass, fill in the sky pixels
     if (surface.is_sky() && pass_is_opaque())
     {
-        light_emissive       = tex2.SampleLevel(samplers[sampler_bilinear_clamp], direction_sphere_uv(surface.camera_to_pixel), 0).rgb;
+        // skysphere.hlsl mirrors below horizon directions to the upper hemisphere and dims
+        // them to 0.3x for ibl correctness, sampling the texture at view_dir.y just below
+        // zero therefore returns the dimmed sky and produces a hard dark band right where
+        // the camera ray crosses the horizon (which is exactly where rays past the edge
+        // of the floor land), clamping y to the upper hemisphere here keeps the visible
+        // sky uniform across the horizon line so it can no longer show a dark strip
+        float3 view_dir_sky  = surface.camera_to_pixel;
+        view_dir_sky.y       = max(view_dir_sky.y, 0.0f);
+        view_dir_sky         = normalize(view_dir_sky);
+        light_emissive       = tex2.SampleLevel(samplers[sampler_bilinear_clamp], direction_sphere_uv(view_dir_sky), 0).rgb;
         alpha                = 0.0f;
         distance_from_camera = FLT_MAX_16;
     }
@@ -54,15 +124,26 @@ void main_cs(uint3 thread_id : SV_DispatchThreadID)
     {
         light_diffuse        = tex3.SampleLevel(samplers[sampler_point_clamp], surface.uv, 0).rgb;
         light_specular       = tex4.SampleLevel(samplers[sampler_point_clamp], surface.uv, 0).rgb;
-        light_emissive       = surface.emissive * surface.albedo;
+        // hdr boost so emission crosses the bloom threshold, gbuffer stores emission in [0,1]
+        // emissive from albedo gets a much stronger boost so plain colored materials with no
+        // emissive texture still glow visibly at default bloom intensity
+        bool        is_emissive_from_albedo = (surface.flags & uint(1U << 15)) != 0;
+        const float emission_strength       = is_emissive_from_albedo ? 250.0f : 25.0f;
+        light_emissive       = surface.emissive * surface.albedo * emission_strength;
         alpha                = surface.alpha;
         distance_from_camera = surface.camera_to_pixel_length;
 
         // restir_pt outputs pre-shaded gi (diffuse_brdf * cos * radiance * W),
         // so it bypasses the *albedo multiply below and is added directly
+        // gi is at restir_pt_scale of render resolution, so use a join-bilateral
+        // upsample (depth + normal aware) to avoid bleeding across edges
+        // also multiply by surface.occlusion to recover contact shadows that
+        // restir's spatial reuse and denoiser smear away at small scales
         if (is_restir_pt_enabled())
         {
-            light_gi = tex6.SampleLevel(samplers[sampler_bilinear_clamp], surface.uv, 0).rgb;
+            float depth_dst_lin = linearize_depth(surface.depth);
+            light_gi = sample_gi_bilateral(surface.uv, depth_dst_lin, surface.normal);
+            light_gi *= surface.occlusion;
         }
     }
     
@@ -74,8 +155,15 @@ void main_cs(uint3 thread_id : SV_DispatchThreadID)
         float3 camera_position = get_camera_position();
         float3 view_dir        = normalize(surface.position - camera_position);
     
-        // sample sky in view direction
-        float2 view_uv        = direction_sphere_uv(view_dir);
+        // sample sky in view direction, clamped to the upper hemisphere with a soft fade across
+        // the horizon, the skysphere mirrors the lower hemisphere at 0.3x luminance for ibl which
+        // produces a hard black band at the horizon when distant ground pixels (view_dir.y just
+        // below zero) sample the dimmed half while sky pixels just above sample the bright half
+        // atmospheric haze in real life is lit by the sky above regardless of which way the ray
+        // points, so we lift y toward the upper hemisphere for the fog tint
+        float3 view_dir_sky = float3(view_dir.x, max(view_dir.y, 0.0f), view_dir.z);
+        view_dir_sky        = normalize(view_dir_sky);
+        float2 view_uv        = direction_sphere_uv(view_dir_sky);
         float3 sky_color_view = tex2.SampleLevel(samplers[sampler_trilinear_clamp], view_uv, sky_mip).rgb;
     
         // sample sky in the light direction
@@ -97,14 +185,42 @@ void main_cs(uint3 thread_id : SV_DispatchThreadID)
         float fog_atmospheric = get_fog_atmospheric(distance_from_camera, surface.position.y);
         float3 fog_volumetric = tex5.SampleLevel(samplers[sampler_point_clamp], surface.uv, 0).rgb;
         
-        // fog blending: atmospheric (base), volumetric (additive with shadows)
-        // base atmospheric fog in-scatter (no shadows)
-        float3 fog_inscatter = fog_atmospheric * sky_color;
-        
-        // add volumetric fog (already includes all lights with shadows)
-        // volumetric fog is computed per-light in light.hlsl and accumulated
-        // it already accounts for shadow maps, so we can add it directly
-        light_atmospheric = fog_inscatter + fog_volumetric;
+        if (surface.is_sky())
+        {
+            // sky already integrates atmospheric scattering inside skysphere.hlsl, the
+            // previous code added fog_atmospheric * sky_color on top which roughly
+            // doubled the sky brightness and amplified the discontinuity against any
+            // unlit ground edge below, only volumetric beams (god rays) should be
+            // additive on the sky
+            light_atmospheric = fog_volumetric;
+        }
+        else
+        {
+            // ground horizon haze, fades upward facing surfaces (floor, water) into the
+            // sky color when the camera ray points nearly horizontal at them, this is
+            // exactly the floor at the horizon, the dual gate (camera ray near
+            // horizontal AND normal pointing up) keeps the effect from touching the car
+            // body, walls, or anything else in the foreground because none of those
+            // satisfy both conditions at once, atmospheric fog density alone can never
+            // fully bridge the gap in small scenes (a 200m floor in a 10km camera far
+            // plane gives a fog factor of just a few percent which leaves the floor
+            // edge dark while the sky pixel above it is at full brightness)
+            float view_horizon  = smoothstep(0.10f, 0.0f, abs(view_dir.y));
+            float ground_facing = smoothstep(0.70f, 0.95f, surface.normal.y);
+            float horizon_haze  = view_horizon * ground_facing;
+            
+            // proper extinction based fog blending, surface lighting fades along the
+            // optical path while sky inscatter fills in the missing energy, the
+            // previous purely additive form left distant unlit ground pitch black no
+            // matter how dense the fog became
+            float fog_factor    = max(fog_atmospheric, horizon_haze);
+            float transmittance = 1.0f - fog_factor;
+            light_diffuse  *= transmittance;
+            light_specular *= transmittance;
+            light_emissive *= transmittance;
+            light_gi       *= transmittance;
+            light_atmospheric = fog_factor * sky_color + fog_volumetric;
+        }
     }
 
     // transparent surfaces sample background via refraction, no need to blend

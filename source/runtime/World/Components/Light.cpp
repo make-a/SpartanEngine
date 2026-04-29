@@ -23,6 +23,7 @@ CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 #include "pch.h"
 #include "Light.h"
 #include "Camera.h"
+#include "Render.h"
 #include "../World.h"
 #include "../Entity.h"
 #include "../../Rendering/Renderer.h"
@@ -279,6 +280,7 @@ namespace spartan
             "GetAreaWidth",                 &Light::GetAreaWidth,
             "SetAreaHeight",                &Light::SetAreaHeight,
             "GetAreaHeight",                &Light::GetAreaHeight,
+            "FitToMesh",                    &Light::FitToMesh,
 
             "IsInViewFrustrum",             &Light::IsInViewFrustum,
 
@@ -598,6 +600,36 @@ namespace spartan
         UpdateMatrices();
     }
 
+    bool Light::FitToMesh()
+    {
+        // only meaningful for area lights (rectangular emitter)
+        if (m_light_type != LightType::Area)
+            return false;
+
+        Render* renderable = GetEntity()->GetComponent<Render>();
+        if (!renderable || !renderable->GetMesh())
+            return false;
+
+        const BoundingBox& bbox_local = renderable->GetBoundingBoxMesh();
+        const Vector3 bbox_extent     = bbox_local.GetMax() - bbox_local.GetMin();
+        if (bbox_extent == Vector3::Zero)
+            return false;
+
+        // bbox is in mesh local space, scale by the entity's world scale to get the world footprint
+        const Vector3 world_scale     = GetEntity()->GetScale();
+        const Vector3 scaled_extent(bbox_extent.x * world_scale.x, bbox_extent.y * world_scale.y, bbox_extent.z * world_scale.z);
+
+        // pick the two largest extents so the rectangle matches the tube regardless of which local axis it was authored along
+        float e[3] = { scaled_extent.x, scaled_extent.y, scaled_extent.z };
+        if (e[0] < e[1]) swap(e[0], e[1]);
+        if (e[1] < e[2]) swap(e[1], e[2]);
+        if (e[0] < e[1]) swap(e[0], e[1]);
+
+        SetAreaWidth(e[0]);
+        SetAreaHeight(e[1]);
+        return true;
+    }
+
     bool Light::NeedsSkysphereUpdate() const
     {
         if (m_light_type != LightType::Directional)
@@ -692,12 +724,13 @@ namespace spartan
         }
         else if (m_light_type == LightType::Spot)
         {
-            m_matrix_view[0] = Matrix::CreateLookAtLH(position, position + GetEntity()->GetForward(), Vector3::Up);
+            // use the entity's own up vector so a forward of world up or down does not collapse the cross product
+            m_matrix_view[0] = Matrix::CreateLookAtLH(position, position + GetEntity()->GetForward(), GetEntity()->GetUp());
         }
         else if (m_light_type == LightType::Area)
         {
-            // area light looks along its forward direction
-            m_matrix_view[0] = Matrix::CreateLookAtLH(position, position + GetEntity()->GetForward(), Vector3::Up);
+            // use the entity's own up vector so a forward of world up or down does not collapse the cross product
+            m_matrix_view[0] = Matrix::CreateLookAtLH(position, position + GetEntity()->GetForward(), GetEntity()->GetUp());
         }
         else if (m_light_type == LightType::Point)
         {
@@ -739,16 +772,13 @@ namespace spartan
         }
         else if (m_light_type == LightType::Area)
         {
-            // area lights use orthographic projection based on their dimensions
-            float half_width  = m_area_width * 0.5f;
-            float half_height = m_area_height * 0.5f;
-
-            m_matrix_projection[0] = Matrix::CreateOrthoOffCenterLH(
-                -half_width, half_width,
-                -half_height, half_height,
-                m_range, 0.05f
-            );
-            m_frustums[0] = Frustum(m_matrix_view[0], m_matrix_projection[0]);
+            // wide perspective from the rectangle center so the shadow map captures occluders
+            // across the front hemisphere, an orthographic at the rectangle size only covers
+            // a narrow column directly under the emitter and misses anything outside it
+            const float fov_y_radians = math::deg_to_rad * 120.0f;
+            const float aspect_ratio  = 1.0f;
+            m_matrix_projection[0]    = Matrix::CreatePerspectiveFieldOfViewLH(fov_y_radians, aspect_ratio, m_range, 0.05f);
+            m_frustums[0]             = Frustum(m_matrix_view[0], m_matrix_projection[0]);
         }
         else // spot/point
         {
